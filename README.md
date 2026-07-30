@@ -1,11 +1,54 @@
 # hypr-music-bg
 
+> [!WARNING]
+> **Work in progress. Not ready for general use, and not accepting issues yet.**
+>
+> The Issues tab is deliberately disabled. Config keys, the control protocol and
+> the source chain are all still moving, and large parts have only ever run on
+> one machine. Please don't build anything on this yet.
+>
+> If you found this and it looks useful: star it and come back. See
+> [Project status](#project-status) for exactly what is and isn't verified.
+
 Sets the currently playing track's album art as your wallpaper, on Hyprland and
 other Wayland compositors.
 
 Event-driven off MPRIS via D-Bus — no polling loop. Pulls art from a
 configurable chain of sources with a resolution floor and match verification,
 and renders per monitor.
+
+## Project status
+
+Verified end-to-end on real hardware:
+
+- `mpris`, `local`, `coverartarchive` and `deezer` sources
+- The resolution-floor and match-verification policy, including fallthrough
+- DankMaterialShell as wallpaper backend
+- Per-monitor and spanning render layouts across two 2560x1440 displays
+- MPRIS event handling: album changes, pause, stop, resume
+- The control socket and every CLI subcommand
+
+**Implemented but never executed against a live service** — no credentials, so
+no real call has been made. Treat as unproven:
+
+- `spotify`, `discogs`, `fanarttv`, `subsonic`, `itunes`, `exec`
+
+Their URL construction, auth shape and response parsing are unit-tested, but
+"compiles and parses a fixture" is not "works".
+
+Known gaps:
+
+- **The cache grows without bound.** Roughly 3 MB per album, mostly rendered
+  PNGs, with no eviction. Fine for a session, bad after a month.
+- Tested on exactly one configuration: Hyprland + DankMaterialShell, two
+  1440p displays, Feishin against Navidrome. swww, hyprpaper and swaybg
+  backends are implemented but unexercised.
+- Internet radio and other thin-metadata sources are rejected rather than
+  handled. Parsing `Artist - Title` out of stream titles is planned.
+- No monitor hotplug handling for the captured original wallpaper.
+
+Roadmap, roughly in order: system tray, matugen/pywal colour theming, cache
+eviction, resolver policy tests, a settings GUI, packaging.
 
 ## Why another one
 
