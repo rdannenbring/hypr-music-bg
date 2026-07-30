@@ -1,0 +1,163 @@
+# hypr-music-bg — example configuration
+#
+# Copy to ~/.config/hypr-music-bg/config.toml. Every section is optional; the
+# defaults below are what you get with no config file at all.
+
+[player]
+# Bus-name fragments to prefer, best first. Matched case-insensitively.
+prefer = ["Feishin"]
+
+# Never follow these. Browsers register on MPRIS and will otherwise hijack the
+# wallpaper with whatever video tab is open.
+ignore = ["chromium", "chrome", "firefox", "brave", "vlc", "mpv"]
+
+
+[art]
+# The shortest edge, in pixels, that a cover must have to be accepted. A source
+# returning art below this is passed over in favour of the next one.
+#
+# This is the knob that matters. It is why `mpris` can sit first in the chain
+# without costing you quality: it answers instantly and can never name the wrong
+# album, but if your server only stores a 300px thumbnail it falls through to a
+# source that has something bigger.
+min_resolution = 600
+
+# Check every candidate from a search-based source against the MPRIS metadata.
+# Leave this on. iTunes in particular answers queries for records it does not
+# carry with confident, unrelated albums rather than an empty result.
+verify_match = true
+match_threshold = 0.6
+
+# When nothing clears min_resolution, use the largest art that was found anyway
+# rather than giving up. Set false to go straight to fallback_wallpaper.
+allow_degraded = true
+
+# Used when nothing validates at all, and what playback stopping reverts to if
+# no pre-daemon wallpaper was ever captured. A file, or a directory to pick from.
+#
+# Worth setting. Without it, restore has nothing to put back: the daemon captures
+# whatever the compositor reports at startup, but it refuses to record its own
+# renders, so after a first run there may be nothing to fall back to.
+#
+# Rendered plainly (cropped to fit, no blur or centred cover), and sliced across
+# monitors automatically when the image is wide enough to have been authored for
+# a spanning layout.
+fallback_wallpaper = "~/Pictures/wallpapers"
+
+# Remember that an album has no art anywhere, so replaying it does not re-walk
+# the chain and re-spend MusicBrainz's one-request-per-second budget.
+negative_cache_ttl = 86400
+
+
+# ---------------------------------------------------------------------------
+# Sources, in priority order. The chain stops at the first candidate that both
+# verifies and clears min_resolution.
+#
+# Credentials are always taken by reference — an env var name, never the secret
+# itself — so a config you paste into an issue cannot leak anything.
+# ---------------------------------------------------------------------------
+
+# Whatever the player already handed us. Instant, no network for local files,
+# and structurally incapable of naming the wrong album.
+[[art.source]]
+name = "mpris"
+
+# Cover files on disk: next to the audio file the player is playing, and under
+# any library roots you list here as <root>/<artist>/<album>/cover.jpg.
+[[art.source]]
+name = "local"
+paths = ["/mnt/music"]
+
+# MusicBrainz release-group lookup, then Cover Art Archive. Keyless, high
+# quality, two hops. size picks a thumbnail (250, 500, 1200); size = 0 fetches
+# the original upload, frequently 1000-3000px but a larger download.
+[[art.source]]
+name = "coverartarchive"
+size = 1200
+
+# Deezer's public catalogue. Keyless, one hop — the best zero-config remote
+# source. Measured ceiling is 1200: asking for more silently returns 1200.
+[[art.source]]
+name = "deezer"
+size = 1200
+
+
+# --- Optional sources, disabled by default -------------------------------
+
+# Apple iTunes Search. Keyless and resizable to ~3000px, but see verify_match
+# above: it returns wrong albums confidently. Only safe with verification on.
+# [[art.source]]
+# name = "itunes"
+# size = 1200
+
+# Spotify. Requires registering an app; tops out at 640px, which is smaller
+# than keyless Deezer. Useful as a match cross-check more than for resolution.
+# [[art.source]]
+# name = "spotify"
+# client_id_env = "SPOTIFY_CLIENT_ID"
+# client_secret_env = "SPOTIFY_CLIENT_SECRET"
+
+# Discogs. Strong release matching (distinguishes pressings), around 600px.
+# [[art.source]]
+# name = "discogs"
+# token_env = "DISCOGS_TOKEN"
+
+# fanart.tv. Its artist backgrounds are 1920x1080 and drawn specifically to be
+# used as wallpapers, which suits a 16:9 screen better than a zoomed square
+# cover. The catch: a background belongs to the artist, so it will not change
+# between albums by the same act. Per-album covers are also returned when
+# fanart.tv has them, and are preferred.
+# [[art.source]]
+# name = "fanarttv"
+# api_key_env = "FANARTTV_API_KEY"
+# require_mbid = false
+
+# A Subsonic-compatible server (Navidrome, Airsonic, Gonic). Redundant if your
+# player already exposes the server's art over MPRIS. Note that Subsonic's size
+# parameter only ever scales *down* — it will not upscale a small stored image.
+# [[art.source]]
+# name = "subsonic"
+# url = "https://music.example.com"
+# username = "you"
+# password_env = "SUBSONIC_PASSWORD"
+
+# Escape hatch: any command that prints image paths on stdout. This is how you
+# plug in sacad, beets fetchart, or your own script. It receives HMB_ARTIST,
+# HMB_ALBUM_ARTIST, HMB_ALBUM and HMB_TITLE in its environment.
+# [[art.source]]
+# name = "exec"
+# command = "/home/you/.local/bin/my-art-finder"
+# args = []
+
+
+[render]
+# blur  — blurred zoomed cover as backdrop, sharp cover centred on top
+# fill  — cover scaled to fill the screen and cropped
+# fit   — cover letterboxed against a colour sampled from its own edges
+style = "blur"
+
+# per_monitor — centre the cover on each screen independently
+# span        — build one canvas across the whole layout and slice it, so the
+#               image reads as continuous across the seam
+layout = "per_monitor"
+
+# Cover size as a fraction of the screen's shorter edge.
+cover_scale = 0.55
+blur_strength = 8.0
+
+# Darkening applied to the backdrop, for desktop-icon legibility.
+darken = 0.25
+
+
+[wallpaper]
+# auto | dms | swww | hyprpaper | swaybg | command
+# auto probes for whatever is actually running.
+backend = "auto"
+
+# For backend = "command". {image} and {monitor} are substituted.
+# command = "swww img --outputs {monitor} {image}"
+
+
+[behavior]
+restore_on_pause = false
+restore_on_stop = true

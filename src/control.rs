@@ -1,0 +1,291 @@
+//! Control surface: a Unix socket, the CLI that talks to it, and the status
+//! snapshot they exchange.
+//!
+//! The daemon needs shared state and a command channel for the tray anyway, so
+//! exposing them over a socket costs almost nothing extra and makes the same
+//! actions reachable from a Hyprland keybind, a waybar module, or a shell
+//! script. The wire format is line-delimited JSON specifically so it can be
+//! driven by hand:
+//!
+//! ```text
+//! echo '{"command":"status"}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/hypr-music-bg.sock
+//! ```
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
+
+/// One instruction for the running daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "kebab-case")]
+pub enum Command {
+    /// Everything the daemon currently knows, for display.
+    Status,
+    Toggle,
+    Enable,
+    Disable,
+    /// Re-resolve and re-apply art for whatever is playing.
+    Refresh {
+        /// Ignore the lookup cache, in case a source now has better art.
+        #[serde(default)]
+        bypass_cache: bool,
+    },
+    /// Put back the pre-daemon wallpaper.
+    Restore,
+    /// Re-read the config file and rebuild the source chain.
+    Reload,
+    ClearCache,
+    /// Change the log filter without restarting.
+    LogLevel {
+        level: String,
+    },
+    Quit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Response {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<Status>,
+}
+
+impl Response {
+    pub fn ok(message: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            message: Some(message.into()),
+            status: None,
+        }
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            message: Some(message.into()),
+            status: None,
+        }
+    }
+
+    pub fn with_status(status: Status) -> Self {
+        Self {
+            ok: true,
+            message: None,
+            status: Some(status),
+        }
+    }
+}
+
+/// What the art currently on screen is, and where it came from.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ArtStatus {
+    pub source: String,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: u64,
+    /// Accepted despite being under `min_resolution`.
+    pub degraded: bool,
+    /// Cached original, before compositing.
+    pub cache_path: Option<String>,
+}
+
+/// One source's outcome during the last chain walk.
+///
+/// The whole design is a fallback chain, so "which source won, and why did the
+/// earlier ones not" is the single most useful thing to be able to see.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceOutcome {
+    pub source: String,
+    pub outcome: String,
+}
+
+/// A snapshot of the daemon, for the CLI, the tray, and the GUI.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Status {
+    pub enabled: bool,
+    pub version: String,
+
+    pub player: Option<String>,
+    pub playback: String,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub title: Option<String>,
+
+    pub art: Option<ArtStatus>,
+    pub chain: Vec<SourceOutcome>,
+    pub source_chain: Vec<String>,
+    pub min_resolution: u32,
+
+    pub backend: String,
+    /// Monitor name to the rendered PNG currently applied to it.
+    pub rendered: BTreeMap<String, String>,
+
+    pub cache_bytes: u64,
+    pub log_level: String,
+    pub last_error: Option<String>,
+}
+
+/// Where the socket lives.
+///
+/// `$XDG_RUNTIME_DIR` is the correct home: it is user-private, on tmpfs, and
+/// cleaned up automatically at logout, so a stale socket cannot outlive the
+/// session.
+pub fn socket_path() -> PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| {
+            PathBuf::from(format!(
+                "/tmp/hypr-music-bg-{}",
+                std::env::var("UID").unwrap_or_else(|_| "0".into())
+            ))
+        });
+    dir.join("hypr-music-bg.sock")
+}
+
+/// Implemented by the daemon.
+#[async_trait]
+pub trait Controller: Send + Sync {
+    async fn handle(&self, command: Command) -> Response;
+}
+
+/// Serve the control socket until the process ends.
+pub async fn serve(controller: Arc<dyn Controller>) -> Result<()> {
+    let path = socket_path();
+
+    // A socket left behind by a crashed daemon would block binding, so clear it
+    // — but only after checking nobody is actually listening, otherwise this
+    // would silently steal the socket from a running instance.
+    if path.exists() {
+        if UnixStream::connect(&path).await.is_ok() {
+            anyhow::bail!(
+                "another hypr-music-bg is already listening on {}",
+                path.display()
+            );
+        }
+        tracing::debug!(path = %path.display(), "removing stale socket");
+        std::fs::remove_file(&path).ok();
+    }
+
+    let listener = UnixListener::bind(&path)
+        .with_context(|| format!("binding control socket {}", path.display()))?;
+    tracing::info!(path = %path.display(), "control socket listening");
+
+    loop {
+        let (stream, _addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(error = %e, "control socket accept failed");
+                continue;
+            }
+        };
+
+        let controller = controller.clone();
+        // One task per connection so a slow client cannot stall the daemon.
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(stream, controller).await {
+                tracing::debug!(error = %e, "control connection ended");
+            }
+        });
+    }
+}
+
+async fn handle_connection(stream: UnixStream, controller: Arc<dyn Controller>) -> Result<()> {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let response = match serde_json::from_str::<Command>(&line) {
+            Ok(command) => {
+                tracing::debug!(?command, "control command");
+                controller.handle(command).await
+            }
+            Err(e) => Response::error(format!("could not parse command: {e}")),
+        };
+
+        let mut encoded = serde_json::to_vec(&response)?;
+        encoded.push(b'\n');
+        write_half.write_all(&encoded).await?;
+        write_half.flush().await?;
+    }
+
+    Ok(())
+}
+
+/// Send one command to a running daemon and return its reply.
+pub async fn send(command: &Command) -> Result<Response> {
+    let path = socket_path();
+    let stream = UnixStream::connect(&path).await.with_context(|| {
+        format!(
+            "no daemon listening on {} (is `hypr-music-bg run` started?)",
+            path.display()
+        )
+    })?;
+
+    let (read_half, mut write_half) = stream.into_split();
+    let mut encoded = serde_json::to_vec(command)?;
+    encoded.push(b'\n');
+    write_half.write_all(&encoded).await?;
+    write_half.flush().await?;
+
+    let mut lines = BufReader::new(read_half).lines();
+    let reply = lines
+        .next_line()
+        .await?
+        .context("daemon closed the connection without replying")?;
+
+    Ok(serde_json::from_str(&reply)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commands_round_trip_as_json() {
+        let cases = [
+            (r#"{"command":"status"}"#, "Status"),
+            (r#"{"command":"toggle"}"#, "Toggle"),
+            (r#"{"command":"clear-cache"}"#, "ClearCache"),
+            (r#"{"command":"log-level","level":"debug"}"#, "LogLevel"),
+        ];
+        for (json, label) in cases {
+            let parsed: Command = serde_json::from_str(json).unwrap_or_else(|e| {
+                panic!("{label} should parse from {json}: {e}");
+            });
+            // Re-encoding must produce something the daemon would accept again.
+            let reencoded = serde_json::to_string(&parsed).unwrap();
+            serde_json::from_str::<Command>(&reencoded).unwrap();
+        }
+    }
+
+    #[test]
+    fn refresh_defaults_to_using_the_cache() {
+        let parsed: Command = serde_json::from_str(r#"{"command":"refresh"}"#).unwrap();
+        match parsed {
+            Command::Refresh { bypass_cache } => assert!(!bypass_cache),
+            other => panic!("expected Refresh, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn socket_lives_under_the_runtime_dir() {
+        // Correctness matters here: a socket outside XDG_RUNTIME_DIR would not be
+        // user-private and would survive logout.
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000") };
+        assert_eq!(
+            socket_path(),
+            PathBuf::from("/run/user/1000/hypr-music-bg.sock")
+        );
+    }
+}

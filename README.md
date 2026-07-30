@@ -1,0 +1,189 @@
+# hypr-music-bg
+
+Sets the currently playing track's album art as your wallpaper, on Hyprland and
+other Wayland compositors.
+
+Event-driven off MPRIS via D-Bus — no polling loop. Pulls art from a
+configurable chain of sources with a resolution floor and match verification,
+and renders per monitor.
+
+## Why another one
+
+Everything else in this space is either single-player (MPD only, Spotify only),
+X11-only, or both. The handful of Wayland scripts that exist hardcode one art
+source and take the first response they get.
+
+That last part is the actual problem. Search-based catalogues do not reliably
+signal "I don't have this" — they answer with something else. A live query to
+the iTunes Search API for `D12 - Devil's Night` returns, as its top album
+result:
+
+```
+artistName:     Ophélie Gaillard, Sandrine Piau & Pulcinella Orchestra
+collectionName: Boccherini: Cello Concertos, Stabat Mater & Quintet
+```
+
+Full confidence, valid artwork, wrong universe. A "first response wins" chain
+puts a cello record on your desktop. So every candidate here is checked against
+the MPRIS metadata — the one thing known to be true — before it is accepted.
+
+## How the chain works
+
+Sources are tried in configured order. A candidate is accepted only if it
+**verifies** (looks like the album that is playing) and **clears
+`min_resolution`**. Otherwise the chain moves on.
+
+1. **Preferred** — first source, in order, that verifies and meets the floor.
+2. **Degraded** — nothing met the floor, so the largest thing that verified.
+3. **Fallback** — nothing verified at all, so your configured static wallpaper.
+
+This is what lets `mpris` sit first without costing quality. It answers
+instantly and can never name the wrong album, but many servers only store a
+small thumbnail. Real example on a Navidrome library:
+
+```
+mpris            300x300   below min_resolution 600, deferred
+local            no candidates
+coverartarchive  1200x1190  accepted
+```
+
+Four times the resolution, with the fast, always-correct source still tried
+first.
+
+## Sources
+
+| Source | Key | Hops | Resolution | Notes |
+|---|---|---|---|---|
+| `mpris` | – | 0 | player-dependent | Instant, never the wrong album, often small |
+| `local` | – | 0 | original | Files next to the audio, or `<root>/<artist>/<album>/` |
+| `coverartarchive` | none | 2 | 1200, or originals at 1000–3000px | MusicBrainz-keyed, 1 req/sec |
+| `deezer` | none | 1 | 1200 (measured cap) | Best zero-config remote |
+| `itunes` | none | 1 | ~3000 | Returns wrong albums; needs `verify_match` |
+| `spotify` | OAuth | 1 | 640 | Lower than keyless Deezer |
+| `discogs` | token | 1 | ~600 | Strong release/pressing matching |
+| `fanarttv` | key | 2 | 1920x1080 | Artist *backgrounds*, built as wallpapers |
+| `subsonic` | password | 1 | your library's original | `size` only scales down |
+| `exec` | – | – | – | Any command printing image paths |
+
+Last.fm is deliberately absent: its API still responds, but serves a
+placeholder star instead of artwork.
+
+`fanarttv` is the odd one — its backgrounds are 16:9 and drawn to be
+wallpapers, which suits a screen better than a zoomed square cover, but they
+belong to the artist rather than the album and so will not change between
+records by the same act.
+
+## Install
+
+```bash
+cargo build --release
+install -Dm755 target/release/hypr-music-bg ~/.local/bin/hypr-music-bg
+```
+
+```bash
+mkdir -p ~/.config/hypr-music-bg && cp config.example.toml ~/.config/hypr-music-bg/config.toml
+```
+
+## Usage
+
+```bash
+hypr-music-bg doctor
+```
+
+Prints detected monitors, the active player, the resolved wallpaper backend and
+the source chain. Start here.
+
+```bash
+hypr-music-bg probe
+```
+
+Shows what the chain returns for the current track, and which source won,
+without touching the wallpaper.
+
+```bash
+hypr-music-bg once --dry-run
+```
+
+Renders the wallpapers and prints their paths without applying them. Drop
+`--dry-run` to apply once and exit.
+
+```bash
+hypr-music-bg run
+```
+
+The daemon. Follows the active player until interrupted, then restores the
+wallpaper that was set when it started.
+
+Set `HMB_LOG=debug` for per-source decisions, or change it live with
+`hypr-music-bg log-level debug`.
+
+### Controlling a running daemon
+
+The daemon listens on `$XDG_RUNTIME_DIR/hypr-music-bg.sock`. These subcommands
+talk to it, so they work from a Hyprland keybind or a script:
+
+| Command | Effect |
+|---|---|
+| `status` | Everything it knows: track, art, chain outcome, cache size |
+| `toggle` / `enable` / `disable` | Stop or resume reacting to the player without exiting |
+| `refresh [--bypass-cache]` | Re-resolve the current album; `--bypass-cache` re-walks the chain |
+| `restore` | Put back the pre-daemon wallpaper |
+| `reload` | Re-read the config and rebuild the source chain |
+| `clear-cache` | Delete cached art and renders (keeps the saved original wallpaper) |
+| `log-level <level>` | Change verbosity live |
+| `quit` | Restore and exit cleanly |
+
+`status` is where the chain becomes visible, which is the fastest way to see why
+a given album got the art it did:
+
+```
+chain (min 600px):
+  mpris              300x300, below min 600
+  local              no candidates
+  coverartarchive    1200x1075 accepted
+```
+
+The wire format is line-delimited JSON, so it is drivable by hand:
+
+```bash
+echo '{"command":"status"}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/hypr-music-bg.sock
+```
+
+## Running it as a service
+
+```ini
+# ~/.config/systemd/user/hypr-music-bg.service
+[Unit]
+Description=Album art wallpaper daemon
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hypr-music-bg run
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target
+```
+
+```bash
+systemctl --user enable --now hypr-music-bg.service
+```
+
+## Wallpaper backends
+
+`auto` probes for what is actually running, in order: DankMaterialShell, swww,
+hyprpaper, swaybg. Order matters — a shell that owns the background will
+coexist happily with an installed-but-idle `swww` binary, and driving both
+means they fight over the surface.
+
+Anything else can be driven with `backend = "command"` and a `{image}` /
+`{monitor}` template.
+
+## Configuration
+
+See [config.example.toml](config.example.toml), which documents every option.
+
+Credentials are always referenced by environment variable name, never written
+in the config, so a config file is safe to share.

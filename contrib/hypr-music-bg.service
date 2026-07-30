@@ -1,0 +1,14 @@
+[Unit]
+Description=Album art wallpaper daemon
+Documentation=https://github.com/rdannenbring/hypr-music-bg
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hypr-music-bg run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
