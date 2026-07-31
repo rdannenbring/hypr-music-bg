@@ -44,6 +44,19 @@ pub enum Command {
     LogLevel {
         level: String,
     },
+    /// Change how art is composited, for the current session only.
+    ///
+    /// Session-only is deliberate: the tray can offer a fixed set of choices
+    /// but has nowhere to type a value, so persisting these belongs to the
+    /// settings GUI, which can rewrite the config file properly.
+    Render {
+        #[serde(default)]
+        style: Option<String>,
+        #[serde(default)]
+        layout: Option<String>,
+    },
+    /// Restart the process, via systemd when supervised.
+    Restart,
     Quit,
 }
 
@@ -121,6 +134,9 @@ pub struct Status {
     pub chain: Vec<SourceOutcome>,
     pub source_chain: Vec<String>,
     pub min_resolution: u32,
+    /// Lowercase names matching the config values, for the tray's radio groups.
+    pub render_style: String,
+    pub render_layout: String,
 
     pub backend: String,
     /// Monitor name to the rendered PNG currently applied to it.

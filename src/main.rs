@@ -10,6 +10,7 @@ mod matching;
 mod monitors;
 mod mpris;
 mod track;
+mod tray;
 mod util;
 
 use anyhow::{Context, Result};
@@ -212,7 +213,10 @@ struct App {
     /// playback can put back exactly that.
     original: HashMap<String, PathBuf>,
     /// Published for the CLI, the tray and the GUI.
-    status: RwLock<control::Status>,
+    ///
+    /// A std lock, not a tokio one: ksni's `Tray` methods are synchronous and
+    /// cannot await. Nothing holds this guard across an await point.
+    status: std::sync::RwLock<control::Status>,
     /// False means stay running but stop reacting to the player.
     enabled: AtomicBool,
     /// Remembered so `reload` reads the same file the daemon started with.
@@ -222,6 +226,12 @@ struct App {
     last_track: RwLock<Option<TrackInfo>>,
     /// Raised by `quit`, awaited by the run loop.
     shutdown: tokio::sync::Notify,
+    /// Bumped on any state change, so the tray can refresh its icon and menu.
+    ///
+    /// Not just artwork: the menu shows the enabled checkmark, the render radio
+    /// groups and the log level too, and dbusmenu clients cache the layout until
+    /// its revision changes. Anything altering Status must bump this.
+    state_generation: tokio::sync::watch::Sender<u64>,
 }
 
 impl App {
@@ -267,6 +277,8 @@ impl App {
             version: env!("CARGO_PKG_VERSION").to_string(),
             playback: "Unknown".into(),
             min_resolution: cfg.art.min_resolution,
+            render_style: render_style_name(cfg.render.style),
+            render_layout: layout_name(cfg.render.layout),
             backend: format!("{:?}", wallpaper.backend()),
             source_chain: resolver
                 .source_names()
@@ -285,16 +297,23 @@ impl App {
             }),
             cache,
             original,
-            status: RwLock::new(status),
+            status: std::sync::RwLock::new(status),
             enabled: AtomicBool::new(true),
             config_path,
             last_track: RwLock::new(None),
             shutdown: tokio::sync::Notify::new(),
+            state_generation: tokio::sync::watch::channel(0).0,
         })
     }
 
     fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Tell anything mirroring `Status` that it changed.
+    fn notify_changed(&self) {
+        let next = *self.state_generation.borrow() + 1;
+        self.state_generation.send_replace(next);
     }
 
     /// Resolve art for a track, render it per monitor, and apply it.
@@ -308,7 +327,7 @@ impl App {
 
         *self.last_track.write().await = Some(track.clone());
         {
-            let mut status = self.status.write().await;
+            let mut status = self.status.write().unwrap();
             status.playback = "Playing".into();
             status.player = Some(track.player.clone());
             status.artist = Some(track.search_artist().to_string());
@@ -323,7 +342,7 @@ impl App {
         drop(live);
 
         {
-            let mut status = self.status.write().await;
+            let mut status = self.status.write().unwrap();
             status.chain = resolution.outcomes.clone();
             status.art = resolution.art.as_ref().map(|art| control::ArtStatus {
                 source: art.source.clone(),
@@ -369,6 +388,7 @@ impl App {
             },
         };
 
+        self.notify_changed();
         self.render_and_apply(&bytes, &format!("{}|{label}", track.album_key()), dry_run)
             .await
     }
@@ -426,13 +446,13 @@ impl App {
                     tracing::info!(monitor = %item.monitor, "wallpaper set");
                     self.status
                         .write()
-                        .await
+                        .unwrap()
                         .rendered
                         .insert(item.monitor.clone(), path.display().to_string());
                 }
                 Err(e) => {
                     tracing::error!(monitor = %item.monitor, error = %e, "failed to set wallpaper");
-                    self.status.write().await.last_error = Some(e.to_string());
+                    self.status.write().unwrap().last_error = Some(e.to_string());
                 }
             }
         }
@@ -549,7 +569,7 @@ impl control::Controller for App {
 
         match command {
             C::Status => {
-                let mut status = self.status.read().await.clone();
+                let mut status = self.status.read().unwrap().clone();
                 status.enabled = self.is_enabled();
                 status.cache_bytes = directory_size(self.cache.root());
                 Response::with_status(status)
@@ -610,16 +630,80 @@ impl control::Controller for App {
                     }
                 }
                 self.cache.save_originals(&originals);
+                self.status.write().unwrap().cache_bytes = directory_size(self.cache.root());
+                self.notify_changed();
                 Response::ok(format!("cleared {} KiB", freed / 1024))
             }
 
             C::LogLevel { level } => match set_log_level(&level) {
                 Ok(()) => {
-                    self.status.write().await.log_level = level.clone();
+                    self.status.write().unwrap().log_level = level.clone();
+                    self.notify_changed();
                     Response::ok(format!("log level set to {level}"))
                 }
                 Err(e) => Response::error(e.to_string()),
             },
+
+            C::Render { style, layout } => {
+                let mut live = self.live.write().await;
+                let mut changed = Vec::new();
+                if let Some(style) = &style {
+                    match style.to_ascii_lowercase().as_str() {
+                        "blur" => live.cfg.render.style = RenderStyle::Blur,
+                        "fill" => live.cfg.render.style = RenderStyle::Fill,
+                        "fit" => live.cfg.render.style = RenderStyle::Fit,
+                        other => return Response::error(format!("unknown render style {other:?}")),
+                    }
+                    changed.push(format!("style={style}"));
+                }
+                if let Some(layout) = &layout {
+                    match layout.to_ascii_lowercase().as_str() {
+                        "per_monitor" | "permonitor" => live.cfg.render.layout = Layout::PerMonitor,
+                        "span" => live.cfg.render.layout = Layout::Span,
+                        other => return Response::error(format!("unknown layout {other:?}")),
+                    }
+                    changed.push(format!("layout={layout}"));
+                }
+                let (style_name, layout_name_now) = (
+                    render_style_name(live.cfg.render.style),
+                    layout_name(live.cfg.render.layout),
+                );
+                drop(live);
+                {
+                    let mut status = self.status.write().unwrap();
+                    status.render_style = style_name;
+                    status.render_layout = layout_name_now;
+                }
+                self.notify_changed();
+
+                // Re-render immediately so the change is visible rather than
+                // waiting for the next album.
+                if let Some(track) = self.last_track.read().await.clone() {
+                    self.apply_for_track(&track, false).await.ok();
+                }
+                Response::ok(format!("{} (this session only)", changed.join(", ")))
+            }
+
+            C::Restart => {
+                // Under systemd, let the supervisor do it: re-execing would
+                // orphan the unit's accounting and lose Restart= semantics.
+                if std::env::var_os("INVOCATION_ID").is_some() {
+                    tracing::info!("restarting via systemd");
+                    self.restore().await.ok();
+                    match tokio::process::Command::new("systemctl")
+                        .args(["--user", "restart", "hypr-music-bg.service"])
+                        .spawn()
+                    {
+                        Ok(_) => Response::ok("restarting via systemd"),
+                        Err(e) => Response::error(format!("systemctl failed: {e}")),
+                    }
+                } else {
+                    Response::error(
+                        "not running under systemd; stop and start it again, \
+                         or install contrib/hypr-music-bg.service",
+                    )
+                }
+            }
 
             C::Quit => {
                 tracing::info!("quit requested over control socket");
@@ -637,7 +721,8 @@ impl control::Controller for App {
 impl App {
     async fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Relaxed);
-        self.status.write().await.enabled = enabled;
+        self.status.write().unwrap().enabled = enabled;
+        self.notify_changed();
         tracing::info!(enabled, "daemon toggled");
         if !enabled {
             // Disabled means the desktop should not keep showing our art.
@@ -652,8 +737,10 @@ impl App {
         let wallpaper = Wallpaper::new(&cfg.wallpaper).await?;
 
         {
-            let mut status = self.status.write().await;
+            let mut status = self.status.write().unwrap();
             status.min_resolution = cfg.art.min_resolution;
+            status.render_style = render_style_name(cfg.render.style);
+            status.render_layout = layout_name(cfg.render.layout);
             status.backend = format!("{:?}", wallpaper.backend());
             status.source_chain = resolver
                 .source_names()
@@ -663,15 +750,35 @@ impl App {
         }
 
         // Swapped together, so the chain and the backend never disagree.
-        let mut live = self.live.write().await;
-        *live = Live {
-            cfg,
-            resolver,
-            wallpaper,
-        };
+        {
+            let mut live = self.live.write().await;
+            *live = Live {
+                cfg,
+                resolver,
+                wallpaper,
+            };
+        }
+        self.notify_changed();
         tracing::info!("config reloaded");
         Ok(())
     }
+}
+
+fn render_style_name(style: RenderStyle) -> String {
+    match style {
+        RenderStyle::Blur => "blur",
+        RenderStyle::Fill => "fill",
+        RenderStyle::Fit => "fit",
+    }
+    .into()
+}
+
+fn layout_name(layout: Layout) -> String {
+    match layout {
+        Layout::PerMonitor => "per_monitor",
+        Layout::Span => "span",
+    }
+    .into()
 }
 
 /// Total bytes under a directory, one level deep per subdirectory.
@@ -710,6 +817,8 @@ async fn run(cfg: Config, config_path: Option<PathBuf>) -> Result<()> {
         }
     });
 
+    tray::spawn(app.clone()).await;
+
     let loop_app = app.clone();
     let watch = async move {
         let app = loop_app;
@@ -725,7 +834,7 @@ async fn run(cfg: Config, config_path: Option<PathBuf>) -> Result<()> {
                     let result = match event {
                         mpris::Event::Album(track) => app.apply_for_track(&track, false).await,
                         mpris::Event::Idle(status) => {
-                            app.status.write().await.playback = format!("{status:?}");
+                            app.status.write().unwrap().playback = format!("{status:?}");
                             let behavior = app.live.read().await.cfg.behavior.clone();
                             let should_restore = match status {
                                 PlaybackStatus::Paused => behavior.restore_on_pause,
@@ -742,7 +851,7 @@ async fn run(cfg: Config, config_path: Option<PathBuf>) -> Result<()> {
 
                     if let Err(e) = result {
                         tracing::error!(error = %e, "failed to handle event");
-                        app.status.write().await.last_error = Some(e.to_string());
+                        app.status.write().unwrap().last_error = Some(e.to_string());
                     }
                 }
             })
