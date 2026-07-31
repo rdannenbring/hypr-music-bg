@@ -387,6 +387,7 @@ impl Tray for MusicTray {
         let mut diagnostics: Vec<MenuItem<MusicTray>> = Vec::new();
         diagnostics.push(label(format!("Version: {}", status.version)));
         diagnostics.push(label(format!("Backend: {}", status.backend)));
+        diagnostics.push(label(format!("Theming: {}", status.theme_mode)));
         diagnostics.push(label(format!(
             "Player: {}",
             status.player.as_deref().unwrap_or("none")

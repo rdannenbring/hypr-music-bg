@@ -54,8 +54,7 @@ Known gaps:
   handled. Parsing `Artist - Title` out of stream titles is planned.
 - No monitor hotplug handling for the captured original wallpaper.
 
-Roadmap, roughly in order: matugen/pywal colour theming, a settings GUI,
-stream title parsing, packaging.
+Roadmap, roughly in order: a settings GUI, stream title parsing, packaging.
 
 Resolution currently takes about 2.7 s cold and 0.4 s warm, of which roughly
 2.3 s is network — a MusicBrainz query plus Cover Art Archive's redirect chain.
@@ -224,6 +223,23 @@ WantedBy=graphical-session.target
 ```bash
 systemctl --user enable --now hypr-music-bg.service
 ```
+
+## Colour theming
+
+Off by default, and that is deliberate: recolouring GTK, your terminal and your
+browser on every album change is a much larger intervention than setting a
+wallpaper, and installing a wallpaper tool is not consent for it.
+
+`theme.mode = "auto"` opts in and picks per setup. Shells that already theme
+themselves from the wallpaper are left alone — DankMaterialShell binds its
+scheme to the wallpaper it is handed, so setting one through it has *already*
+re-derived the colours from the album art by the time we could act, and running
+matugen ourselves would race it for the same template outputs. On swww,
+hyprpaper or swaybg there is no such integration, so `auto` runs matugen, or
+pywal if matugen is absent.
+
+`source` picks what gets sampled: `cover` for purer colours from the artwork
+itself, or `wallpaper` for the composed image actually on screen.
 
 ## Wallpaper backends
 

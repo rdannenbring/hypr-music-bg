@@ -17,6 +17,49 @@ pub struct Config {
     pub wallpaper: WallpaperConfig,
     #[serde(default)]
     pub behavior: BehaviorConfig,
+    #[serde(default)]
+    pub theme: ThemeConfig,
+}
+
+/// Regenerating a desktop colour scheme from the artwork.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ThemeConfig {
+    #[serde(default)]
+    pub mode: ThemeMode,
+    #[serde(default)]
+    pub source: ThemeSource,
+    /// For `mode = "command"`. `{image}` is substituted.
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
+    /// Do nothing. The default, deliberately.
+    ///
+    /// Recolouring GTK, the terminal, the browser and everything else on every
+    /// album change is a far larger intervention than setting a wallpaper, and
+    /// nobody installing a wallpaper tool has asked for it. Opt in.
+    #[default]
+    Off,
+    /// Skip when the wallpaper backend already themes itself, otherwise use
+    /// whatever is installed.
+    Auto,
+    Matugen,
+    Pywal,
+    Command,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeSource {
+    /// The artwork as fetched: purer colours.
+    #[default]
+    Cover,
+    /// The composed wallpaper: what is actually on screen, blur included.
+    Wallpaper,
 }
 
 #[derive(Debug, Clone, Deserialize)]

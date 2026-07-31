@@ -9,6 +9,7 @@ mod control;
 mod matching;
 mod monitors;
 mod mpris;
+mod theme;
 mod track;
 mod tray;
 mod util;
@@ -24,6 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use theme::Theming;
 use tokio::sync::RwLock;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -203,6 +205,7 @@ struct Live {
     cfg: Config,
     resolver: Resolver,
     wallpaper: Wallpaper,
+    theming: Theming,
 }
 
 /// Everything the event loop needs.
@@ -239,6 +242,7 @@ impl App {
         let cache = Cache::new(cfg.cache_dir())?;
         let resolver = Resolver::new(&cfg.art, cache.clone())?;
         let wallpaper = Wallpaper::new(&cfg.wallpaper).await?;
+        let theming = Theming::new(&cfg.theme, wallpaper.backend()).await;
 
         // Snapshot the wallpaper that was up before we ever touched anything.
         //
@@ -280,6 +284,7 @@ impl App {
             render_style: render_style_name(cfg.render.style),
             render_layout: layout_name(cfg.render.layout),
             backend: format!("{:?}", wallpaper.backend()),
+            theme_mode: format!("{:?}", theming.mode()),
             source_chain: resolver
                 .source_names()
                 .iter()
@@ -294,6 +299,7 @@ impl App {
                 cfg,
                 resolver,
                 wallpaper,
+                theming,
             }),
             cache,
             original,
@@ -308,6 +314,38 @@ impl App {
 
     fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Regenerate the desktop colour scheme from the artwork just applied.
+    ///
+    /// A no-op under `auto` when the wallpaper backend themes itself, which is
+    /// the common case on shells like DankMaterialShell.
+    async fn retheme(&self) {
+        let (cover, wallpaper) = {
+            let status = self.status.read().unwrap();
+            let cover = status
+                .art
+                .as_ref()
+                .and_then(|art| art.cache_path.clone())
+                .map(PathBuf::from);
+            let wallpaper = status.rendered.values().next().map(PathBuf::from);
+            (cover, wallpaper)
+        };
+
+        // Fall back to whichever is available: sampling the composed wallpaper
+        // is still better than skipping, and vice versa.
+        let (Some(cover), Some(wallpaper)) =
+            (cover.clone().or(wallpaper.clone()), wallpaper.or(cover))
+        else {
+            return;
+        };
+
+        self.live
+            .read()
+            .await
+            .theming
+            .apply(&cover, &wallpaper)
+            .await;
     }
 
     /// Size and age bounds from the current config.
@@ -434,6 +472,10 @@ impl App {
         let result = self
             .render_and_apply(&bytes, &format!("{}|{label}", track.album_key()), dry_run)
             .await;
+
+        if !dry_run {
+            self.retheme().await;
+        }
         // After, not before: the renders just applied are now in `status.rendered`
         // and therefore protected from eviction.
         self.prune_cache().await;
@@ -782,6 +824,7 @@ impl App {
         let cfg = Config::load(self.config_path.as_deref())?;
         let resolver = Resolver::new(&cfg.art, self.cache.clone())?;
         let wallpaper = Wallpaper::new(&cfg.wallpaper).await?;
+        let theming = Theming::new(&cfg.theme, wallpaper.backend()).await;
 
         {
             let mut status = self.status.write().unwrap();
@@ -789,6 +832,7 @@ impl App {
             status.render_style = render_style_name(cfg.render.style);
             status.render_layout = layout_name(cfg.render.layout);
             status.backend = format!("{:?}", wallpaper.backend());
+            status.theme_mode = format!("{:?}", theming.mode());
             status.source_chain = resolver
                 .source_names()
                 .iter()
@@ -803,6 +847,7 @@ impl App {
                 cfg,
                 resolver,
                 wallpaper,
+                theming,
             };
         }
         self.notify_changed();
@@ -1137,6 +1182,7 @@ fn print_status(s: &control::Status) {
     }
 
     println!("backend:  {}", s.backend);
+    println!("theming:  {}", s.theme_mode);
     println!("sources:  {}", s.source_chain.join(", "));
     println!("cache:    {} KiB", s.cache_bytes / 1024);
     println!("log:      {}", s.log_level);

@@ -143,6 +143,8 @@ pub struct Status {
     pub rendered: BTreeMap<String, String>,
 
     pub cache_bytes: u64,
+    /// Resolved theming mode: what `auto` actually decided.
+    pub theme_mode: String,
     pub log_level: String,
     pub last_error: Option<String>,
 }
