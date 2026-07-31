@@ -31,6 +31,8 @@ Verified end-to-end on real hardware:
   (verified by introspecting dbusmenu over D-Bus)
 - Cache eviction, including the rule that a wallpaper currently on screen is
   never evicted — measured against a real 126 MB cache
+- The acceptance policy itself: fallthrough, degradation, match rejection,
+  deferred candidates, and both cache short circuits
 
 **Implemented but never executed against a live service** — no credentials, so
 no real call has been made. Treat as unproven:
@@ -52,8 +54,8 @@ Known gaps:
   handled. Parsing `Artist - Title` out of stream titles is planned.
 - No monitor hotplug handling for the captured original wallpaper.
 
-Roadmap, roughly in order: matugen/pywal colour theming, resolver policy tests,
-a settings GUI, stream title parsing, packaging.
+Roadmap, roughly in order: matugen/pywal colour theming, a settings GUI,
+stream title parsing, packaging.
 
 Resolution currently takes about 2.7 s cold and 0.4 s warm, of which roughly
 2.3 s is network — a MusicBrainz query plus Cover Art Archive's redirect chain.

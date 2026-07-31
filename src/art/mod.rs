@@ -265,6 +265,27 @@ impl Resolver {
         })
     }
 
+    /// Build a resolver over a fixed set of sources.
+    ///
+    /// Exists so the acceptance policy can be tested against real image files
+    /// without touching the network: the tiering is the most consequential logic
+    /// here and was previously covered only by its inputs.
+    #[cfg(test)]
+    fn with_sources(sources: Vec<Arc<dyn ArtSource>>, cache: Cache, cfg: &ArtConfig) -> Self {
+        Self {
+            sources,
+            ctx: Ctx {
+                http: reqwest::Client::new(),
+                cache,
+            },
+            min_resolution: cfg.min_resolution,
+            verify_match: cfg.verify_match,
+            match_threshold: cfg.match_threshold,
+            allow_degraded: cfg.allow_degraded,
+            negative_cache_ttl: cfg.negative_cache_ttl,
+        }
+    }
+
     pub fn source_names(&self) -> Vec<&'static str> {
         self.sources.iter().map(|s| s.name()).collect()
     }
@@ -559,4 +580,476 @@ impl Resolver {
 pub fn probe_dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
     let reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
     Ok(reader.into_dimensions()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::track::TrackInfo;
+
+    /// A source that returns whatever it was handed.
+    struct FakeSource {
+        name: &'static str,
+        refs: Vec<ArtRef>,
+        needs_search: bool,
+        fail: bool,
+    }
+
+    impl FakeSource {
+        fn new(name: &'static str, refs: Vec<ArtRef>) -> Self {
+            Self {
+                name,
+                refs,
+                needs_search: true,
+                fail: false,
+            }
+        }
+
+        fn failing(name: &'static str) -> Self {
+            Self {
+                name,
+                refs: Vec::new(),
+                needs_search: true,
+                fail: true,
+            }
+        }
+
+        fn local(mut self) -> Self {
+            self.needs_search = false;
+            self
+        }
+
+        fn boxed(self) -> Arc<dyn ArtSource> {
+            Arc::new(self)
+        }
+    }
+
+    #[async_trait]
+    impl ArtSource for FakeSource {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn find(&self, _track: &TrackInfo, _ctx: &Ctx) -> Result<Vec<ArtRef>> {
+            if self.fail {
+                return Err(anyhow!("source exploded"));
+            }
+            Ok(self.refs.clone())
+        }
+
+        fn needs_search_metadata(&self) -> bool {
+            self.needs_search
+        }
+    }
+
+    struct Fixture {
+        root: PathBuf,
+        cache: Cache,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "hmb-resolve-{}-{name}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::remove_dir_all(&root).ok();
+            let cache = Cache::new(&root).unwrap();
+            Self { root, cache }
+        }
+
+        /// A real PNG on disk, so the resolver decodes genuine dimensions
+        /// rather than trusting what a source advertised.
+        fn image(&self, name: &str, width: u32, height: u32) -> PathBuf {
+            let path = self.root.join(format!("{name}.png"));
+            image::RgbaImage::from_pixel(width, height, image::Rgba([10, 20, 30, 255]))
+                .save(&path)
+                .unwrap();
+            path
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).ok();
+        }
+    }
+
+    fn track() -> TrackInfo {
+        TrackInfo {
+            artist: "D12".into(),
+            album: "Devil's Night".into(),
+            title: "Fight Music".into(),
+            ..TrackInfo::default()
+        }
+    }
+
+    fn config() -> ArtConfig {
+        ArtConfig {
+            min_resolution: 600,
+            negative_cache_ttl: 0,
+            ..ArtConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn takes_the_first_source_that_clears_the_floor() {
+        let fx = Fixture::new("first");
+        let big = fx.image("big", 1200, 1200);
+        let bigger = fx.image("bigger", 2000, 2000);
+
+        let resolver = Resolver::with_sources(
+            vec![
+                FakeSource::new("a", vec![ArtRef::new(Locator::File(big), "a")])
+                    .local()
+                    .boxed(),
+                FakeSource::new("b", vec![ArtRef::new(Locator::File(bigger), "b")])
+                    .local()
+                    .boxed(),
+            ],
+            fx.cache.clone(),
+            &config(),
+        );
+
+        let art = resolver
+            .resolve(&track())
+            .await
+            .art
+            .expect("should resolve");
+        // Order wins over size once the floor is met: later sources are not
+        // consulted at all, which is what keeps the fast path fast.
+        assert_eq!(art.source, "a");
+        assert_eq!(art.width, 1200);
+        assert!(!art.degraded);
+    }
+
+    /// The behaviour the whole design exists for: a source that answers
+    /// instantly but small must not block a later, larger one.
+    #[tokio::test]
+    async fn falls_through_a_source_below_the_floor() {
+        let fx = Fixture::new("fallthrough");
+        let small = fx.image("small", 300, 300);
+        let large = fx.image("large", 1200, 1200);
+
+        let resolver = Resolver::with_sources(
+            vec![
+                FakeSource::new("mpris", vec![ArtRef::new(Locator::File(small), "mpris")])
+                    .local()
+                    .boxed(),
+                FakeSource::new("remote", vec![ArtRef::new(Locator::File(large), "remote")])
+                    .local()
+                    .boxed(),
+            ],
+            fx.cache.clone(),
+            &config(),
+        );
+
+        let resolution = resolver.resolve(&track()).await;
+        let art = resolution.art.expect("should resolve");
+        assert_eq!(art.source, "remote");
+        assert_eq!(art.width, 1200);
+
+        // The walk must record why the first source lost, not just who won.
+        let outcomes: Vec<_> = resolution
+            .outcomes
+            .iter()
+            .map(|o| (o.source.as_str(), o.outcome.as_str()))
+            .collect();
+        assert!(
+            outcomes
+                .iter()
+                .any(|(s, o)| *s == "mpris" && o.contains("below min")),
+            "expected a below-min outcome for mpris, got {outcomes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn degrades_to_the_largest_when_nothing_clears_the_floor() {
+        let fx = Fixture::new("degraded");
+        let tiny = fx.image("tiny", 200, 200);
+        let mid = fx.image("mid", 450, 450);
+
+        let resolver = Resolver::with_sources(
+            vec![
+                FakeSource::new("a", vec![ArtRef::new(Locator::File(tiny), "a")])
+                    .local()
+                    .boxed(),
+                FakeSource::new("b", vec![ArtRef::new(Locator::File(mid), "b")])
+                    .local()
+                    .boxed(),
+            ],
+            fx.cache.clone(),
+            &config(),
+        );
+
+        let art = resolver
+            .resolve(&track())
+            .await
+            .art
+            .expect("should degrade");
+        assert_eq!(art.source, "b", "the largest sub-threshold candidate wins");
+        assert_eq!(art.width, 450);
+        assert!(art.degraded, "must be flagged so the caller can warn");
+    }
+
+    #[tokio::test]
+    async fn allow_degraded_off_gives_up_instead() {
+        let fx = Fixture::new("nodegrade");
+        let tiny = fx.image("tiny", 200, 200);
+
+        let cfg = ArtConfig {
+            allow_degraded: false,
+            ..config()
+        };
+        let resolver = Resolver::with_sources(
+            vec![
+                FakeSource::new("a", vec![ArtRef::new(Locator::File(tiny), "a")])
+                    .local()
+                    .boxed(),
+            ],
+            fx.cache.clone(),
+            &cfg,
+        );
+
+        assert!(resolver.resolve(&track()).await.art.is_none());
+    }
+
+    /// The iTunes failure mode: a confident answer for a different record.
+    #[tokio::test]
+    async fn rejects_a_candidate_that_does_not_match_the_track() {
+        let fx = Fixture::new("verify");
+        let wrong = fx.image("wrong", 1200, 1200);
+        let right = fx.image("right", 900, 900);
+
+        let resolver = Resolver::with_sources(
+            vec![
+                FakeSource::new(
+                    "itunes",
+                    vec![ArtRef::new(Locator::File(wrong), "itunes").with_claim(
+                        "Ophelie Gaillard",
+                        "Boccherini: Cello Concertos, Stabat Mater & Quintet",
+                    )],
+                )
+                .local()
+                .boxed(),
+                FakeSource::new(
+                    "deezer",
+                    vec![
+                        ArtRef::new(Locator::File(right), "deezer")
+                            .with_claim("D12", "Devil's Night"),
+                    ],
+                )
+                .local()
+                .boxed(),
+            ],
+            fx.cache.clone(),
+            &config(),
+        );
+
+        let art = resolver
+            .resolve(&track())
+            .await
+            .art
+            .expect("should resolve");
+        assert_eq!(
+            art.source, "deezer",
+            "the larger but unrelated cover must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_can_be_turned_off() {
+        let fx = Fixture::new("noverify");
+        let wrong = fx.image("wrong", 1200, 1200);
+
+        let cfg = ArtConfig {
+            verify_match: false,
+            ..config()
+        };
+        let resolver = Resolver::with_sources(
+            vec![
+                FakeSource::new(
+                    "itunes",
+                    vec![
+                        ArtRef::new(Locator::File(wrong), "itunes")
+                            .with_claim("Someone Else", "A Different Record"),
+                    ],
+                )
+                .local()
+                .boxed(),
+            ],
+            fx.cache.clone(),
+            &cfg,
+        );
+
+        assert!(resolver.resolve(&track()).await.art.is_some());
+    }
+
+    /// Sources declaring a size below the floor should not be downloaded during
+    /// the preferred pass, but must still be reachable if we reach tier 2.
+    #[tokio::test]
+    async fn deferred_candidates_are_used_only_when_degrading() {
+        let fx = Fixture::new("deferred");
+        let declared_small = fx.image("declared", 800, 800);
+
+        let resolver = Resolver::with_sources(
+            vec![
+                FakeSource::new(
+                    "declares-small",
+                    // Advertises 100x100 but is really 800x800: the engine should
+                    // skip it on the strength of the declaration, then fall back
+                    // to it and discover the real size.
+                    vec![
+                        ArtRef::new(Locator::File(declared_small), "declares-small")
+                            .with_declared(100, 100),
+                    ],
+                )
+                .local()
+                .boxed(),
+            ],
+            fx.cache.clone(),
+            &config(),
+        );
+
+        let art = resolver
+            .resolve(&track())
+            .await
+            .art
+            .expect("should degrade to it");
+        assert_eq!(art.width, 800, "real dimensions win over the declaration");
+        assert!(art.degraded);
+    }
+
+    #[tokio::test]
+    async fn a_failing_source_does_not_stop_the_chain() {
+        let fx = Fixture::new("failing");
+        let good = fx.image("good", 1200, 1200);
+
+        let resolver = Resolver::with_sources(
+            vec![
+                FakeSource::failing("broken").local().boxed(),
+                FakeSource::new("good", vec![ArtRef::new(Locator::File(good), "good")])
+                    .local()
+                    .boxed(),
+            ],
+            fx.cache.clone(),
+            &config(),
+        );
+
+        let resolution = resolver.resolve(&track()).await;
+        assert_eq!(resolution.art.expect("should resolve").source, "good");
+        assert!(
+            resolution
+                .outcomes
+                .iter()
+                .any(|o| o.source == "broken" && o.outcome.contains("error")),
+            "the failure should be reported, not swallowed"
+        );
+    }
+
+    /// Thin metadata must not reach catalogue sources: a lookup would be spent
+    /// and a negative-cache entry written for an album that does not exist.
+    #[tokio::test]
+    async fn search_sources_are_skipped_when_metadata_is_too_thin() {
+        let fx = Fixture::new("thin");
+        let art = fx.image("art", 1200, 1200);
+
+        let stream = TrackInfo {
+            artist: String::new(),
+            album: "WLIR Radio".into(),
+            ..TrackInfo::default()
+        };
+
+        let resolver = Resolver::with_sources(
+            vec![
+                FakeSource::new(
+                    "catalogue",
+                    vec![ArtRef::new(Locator::File(art), "catalogue")],
+                )
+                .boxed(),
+            ],
+            fx.cache.clone(),
+            &config(),
+        );
+
+        let resolution = resolver.resolve(&stream).await;
+        assert!(resolution.art.is_none(), "must not query a catalogue");
+        assert!(
+            resolution
+                .outcomes
+                .iter()
+                .any(|o| o.outcome.contains("too thin")),
+            "the skip should be explained"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remembered_winner_short_circuits_the_chain() {
+        let fx = Fixture::new("lookup");
+        let good = fx.image("good", 1200, 1200);
+
+        let sources = || {
+            vec![
+                FakeSource::new(
+                    "slow",
+                    vec![ArtRef::new(Locator::File(good.clone()), "slow")],
+                )
+                .local()
+                .boxed(),
+            ]
+        };
+
+        let first = Resolver::with_sources(sources(), fx.cache.clone(), &config());
+        assert_eq!(first.resolve(&track()).await.art.unwrap().source, "slow");
+
+        // Second time round there are no sources at all, so anything returned
+        // can only have come from the remembered lookup.
+        let second = Resolver::with_sources(Vec::new(), fx.cache.clone(), &config());
+        let art = second
+            .resolve(&track())
+            .await
+            .art
+            .expect("cache should answer");
+        assert_eq!(art.source, "slow");
+        assert_eq!(art.width, 1200);
+    }
+
+    #[tokio::test]
+    async fn a_negative_result_is_remembered() {
+        let fx = Fixture::new("negative");
+        let cfg = ArtConfig {
+            negative_cache_ttl: 3600,
+            ..config()
+        };
+
+        let empty = Resolver::with_sources(
+            vec![FakeSource::new("nothing", Vec::new()).local().boxed()],
+            fx.cache.clone(),
+            &cfg,
+        );
+        assert!(empty.resolve(&track()).await.art.is_none());
+
+        // A source that *would* answer must not even be consulted, because the
+        // album is now known to have no art.
+        let good = fx.image("good", 1200, 1200);
+        let later = Resolver::with_sources(
+            vec![
+                FakeSource::new("late", vec![ArtRef::new(Locator::File(good), "late")])
+                    .local()
+                    .boxed(),
+            ],
+            fx.cache.clone(),
+            &cfg,
+        );
+        let resolution = later.resolve(&track()).await;
+        assert!(resolution.art.is_none());
+        assert!(
+            resolution
+                .outcomes
+                .iter()
+                .any(|o| o.outcome.contains("no art")),
+            "the short circuit should be visible in the walk"
+        );
+    }
 }
