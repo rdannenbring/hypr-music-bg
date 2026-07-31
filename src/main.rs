@@ -16,7 +16,7 @@ mod util;
 use anyhow::{Context, Result};
 use art::Resolver;
 use backend::Wallpaper;
-use cache::Cache;
+use cache::{Cache, CacheLimits};
 use clap::{Parser, Subcommand};
 use config::{Config, Layout, RenderConfig, RenderStyle};
 use std::collections::HashMap;
@@ -310,6 +310,48 @@ impl App {
         self.enabled.load(Ordering::Relaxed)
     }
 
+    /// Size and age bounds from the current config.
+    async fn cache_limits(&self) -> CacheLimits {
+        let live = self.live.read().await;
+        CacheLimits {
+            max_bytes: live.cfg.art.cache_max_mb.saturating_mul(1024 * 1024),
+            max_age_secs: live.cfg.art.cache_max_age_days.saturating_mul(60 * 60 * 24),
+        }
+    }
+
+    /// Prune the cache, keeping whatever is currently on screen.
+    ///
+    /// The applied renders are excluded because the compositor holds their
+    /// paths rather than copies: deleting one does not cost a re-render, it
+    /// breaks the wallpaper that is up.
+    async fn prune_cache(&self) {
+        let limits = self.cache_limits().await;
+        if limits.max_bytes == 0 && limits.max_age_secs == 0 {
+            return;
+        }
+
+        let mut protected: std::collections::HashSet<PathBuf> = self
+            .status
+            .read()
+            .unwrap()
+            .rendered
+            .values()
+            .map(PathBuf::from)
+            .collect();
+        protected.extend(self.original.values().cloned());
+
+        let cache = self.cache.clone();
+        let freed = tokio::task::spawn_blocking(move || cache.prune(&limits, &protected))
+            .await
+            .unwrap_or_default();
+
+        if freed.removed > 0 {
+            let bytes = self.cache.total_bytes();
+            self.status.write().unwrap().cache_bytes = bytes;
+            self.notify_changed();
+        }
+    }
+
     /// Tell anything mirroring `Status` that it changed.
     fn notify_changed(&self) {
         let next = *self.state_generation.borrow() + 1;
@@ -389,8 +431,13 @@ impl App {
         };
 
         self.notify_changed();
-        self.render_and_apply(&bytes, &format!("{}|{label}", track.album_key()), dry_run)
-            .await
+        let result = self
+            .render_and_apply(&bytes, &format!("{}|{label}", track.album_key()), dry_run)
+            .await;
+        // After, not before: the renders just applied are now in `status.rendered`
+        // and therefore protected from eviction.
+        self.prune_cache().await;
+        result
     }
 
     async fn render_and_apply(
@@ -817,6 +864,7 @@ async fn run(cfg: Config, config_path: Option<PathBuf>) -> Result<()> {
         }
     });
 
+    app.prune_cache().await;
     tray::spawn(app.clone()).await;
 
     let loop_app = app.clone();

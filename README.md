@@ -27,6 +27,10 @@ Verified end-to-end on real hardware:
 - Per-monitor and spanning render layouts across two 2560x1440 displays
 - MPRIS event handling: album changes, pause, stop, resume
 - The control socket and every CLI subcommand
+- The system tray: registration, the full menu tree, and live state tracking
+  (verified by introspecting dbusmenu over D-Bus)
+- Cache eviction, including the rule that a wallpaper currently on screen is
+  never evicted — measured against a real 126 MB cache
 
 **Implemented but never executed against a live service** — no credentials, so
 no real call has been made. Treat as unproven:
@@ -36,10 +40,11 @@ no real call has been made. Treat as unproven:
 Their URL construction, auth shape and response parsing are unit-tested, but
 "compiles and parses a fixture" is not "works".
 
+The tray's **album-art icon** is in the same category: the ARGB conversion has a
+test, but no cover has actually been rendered into a bar yet.
+
 Known gaps:
 
-- **The cache grows without bound.** Roughly 3 MB per album, mostly rendered
-  PNGs, with no eviction. Fine for a session, bad after a month.
 - Tested on exactly one configuration: Hyprland + DankMaterialShell, two
   1440p displays, Feishin against Navidrome. swww, hyprpaper and swaybg
   backends are implemented but unexercised.
@@ -47,8 +52,12 @@ Known gaps:
   handled. Parsing `Artist - Title` out of stream titles is planned.
 - No monitor hotplug handling for the captured original wallpaper.
 
-Roadmap, roughly in order: system tray, matugen/pywal colour theming, cache
-eviction, resolver policy tests, a settings GUI, packaging.
+Roadmap, roughly in order: matugen/pywal colour theming, resolver policy tests,
+a settings GUI, stream title parsing, packaging.
+
+Resolution currently takes about 2.7 s cold and 0.4 s warm, of which roughly
+2.3 s is network — a MusicBrainz query plus Cover Art Archive's redirect chain.
+Not yet optimised.
 
 ## Why another one
 
