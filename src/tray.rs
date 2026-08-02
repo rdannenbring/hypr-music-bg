@@ -385,11 +385,6 @@ impl Tray for MusicTray {
 
         // --- diagnostics -------------------------------------------------
         let mut diagnostics: Vec<MenuItem<MusicTray>> = Vec::new();
-        diagnostics.push(label(format!("Build: {}", status.build.summary())));
-        diagnostics.push(label(format!("Branch: {}", status.build.branch)));
-        if let Some(exe) = &status.build.exe {
-            diagnostics.push(label(shorten(exe)));
-        }
         diagnostics.push(label(format!("Backend: {}", status.backend)));
         diagnostics.push(label(format!("Theming: {}", status.theme_mode)));
         diagnostics.push(label(format!(
@@ -461,6 +456,50 @@ impl Tray for MusicTray {
             StandardItem {
                 label: "Edit config…".into(),
                 activate: Box::new(move |_| open_path(&config_path.display().to_string())),
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        // --- about --------------------------------------------------------
+        //
+        // No build comparison here, unlike `about` on the command line: the tray
+        // runs *inside* the daemon, so what it reports is by definition the
+        // build that is running. There is nothing it could disagree with.
+        let mut about: Vec<MenuItem<MusicTray>> = vec![
+            label(format!("hypr-music-bg {}", status.build.version)),
+            label(format!("commit {}", status.build.commit)),
+            label(format!("branch {}", status.build.branch)),
+            label(format!("built  {}", status.build.built)),
+        ];
+        if status.build.commit.ends_with("-dirty") {
+            about.push(label("⚠ built from an uncommitted tree"));
+        }
+        if let Some(exe) = &status.build.exe {
+            about.push(MenuItem::Separator);
+            about.push(label(shorten(exe)));
+            let open = exe.clone();
+            about.push(
+                StandardItem {
+                    label: "Show binary in file manager".into(),
+                    activate: Box::new(move |_| {
+                        // The parent directory: opening the executable itself
+                        // would try to run it.
+                        let dir = std::path::Path::new(&open)
+                            .parent()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| open.clone());
+                        open_path(&dir)
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        items.push(
+            SubMenu {
+                label: "About".into(),
+                submenu: about,
                 ..Default::default()
             }
             .into(),
