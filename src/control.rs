@@ -11,6 +11,7 @@
 //! echo '{"command":"status"}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/hypr-music-bg.sock
 //! ```
 
+use crate::build_info::BuildInfo;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -136,6 +137,9 @@ pub struct SourceOutcome {
 pub struct Status {
     pub enabled: bool,
     pub version: String,
+    /// The build the *daemon* is running, which is frequently not the build the
+    /// client invoking this was compiled from.
+    pub build: BuildInfo,
 
     pub player: Option<String>,
     pub playback: String,
@@ -202,6 +206,18 @@ pub async fn serve(controller: Arc<dyn Controller>) -> Result<()> {
         }
         tracing::debug!(path = %path.display(), "removing stale socket");
         std::fs::remove_file(&path).ok();
+    }
+
+    // sockaddr_un caps the path at ~108 bytes, and the resulting ENAMETOOLONG
+    // says nothing about why, so check it up front with a message that does.
+    const SUN_PATH_MAX: usize = 100;
+    if path.as_os_str().len() > SUN_PATH_MAX {
+        anyhow::bail!(
+            "control socket path is {} bytes, over the ~{SUN_PATH_MAX} byte limit for \
+             unix sockets: {}",
+            path.as_os_str().len(),
+            path.display()
+        );
     }
 
     let listener = UnixListener::bind(&path)
@@ -333,6 +349,27 @@ mod tests {
         let response: Response = serde_json::from_str(future).expect("must ignore unknown fields");
         assert!(response.ok);
         assert_eq!(response.message.as_deref(), Some("done"));
+    }
+
+    /// A path over the sockaddr_un limit must be reported as such rather than
+    /// surfacing as an unexplained bind failure.
+    #[tokio::test]
+    async fn an_overlong_socket_path_is_explained() {
+        struct Nothing;
+        #[async_trait]
+        impl Controller for Nothing {
+            async fn handle(&self, _: Command) -> Response {
+                Response::ok("")
+            }
+        }
+
+        let long = format!("/tmp/{}", "x".repeat(120));
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &long) };
+        let err = serve(Arc::new(Nothing)).await.unwrap_err().to_string();
+        assert!(
+            err.contains("unix socket") || err.contains("byte limit"),
+            "expected a length explanation, got: {err}"
+        );
     }
 
     #[test]

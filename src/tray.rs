@@ -385,7 +385,11 @@ impl Tray for MusicTray {
 
         // --- diagnostics -------------------------------------------------
         let mut diagnostics: Vec<MenuItem<MusicTray>> = Vec::new();
-        diagnostics.push(label(format!("Version: {}", status.version)));
+        diagnostics.push(label(format!("Build: {}", status.build.summary())));
+        diagnostics.push(label(format!("Branch: {}", status.build.branch)));
+        if let Some(exe) = &status.build.exe {
+            diagnostics.push(label(shorten(exe)));
+        }
         diagnostics.push(label(format!("Backend: {}", status.backend)));
         diagnostics.push(label(format!("Theming: {}", status.theme_mode)));
         diagnostics.push(label(format!(

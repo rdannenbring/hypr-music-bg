@@ -140,11 +140,30 @@ mkdir -p ~/.config/hypr-music-bg && cp config.example.toml ~/.config/hypr-music-
 ## Usage
 
 ```bash
+hypr-music-bg about
+```
+
+Prints this binary's version, git commit and build time, the running daemon's,
+and whether they match. Worth knowing because the crate version stays `0.1.0`
+across every rebuild, so it cannot tell two builds apart — and a daemon started
+before a rebuild keeps running the old code without announcing it:
+
+```
+this binary
+  0.1.0 (91b626f) built 2026-08-02T18:18:15Z
+running daemon
+  0.1.0 (edd46a8) built 2026-07-31T00:25:13Z
+MISMATCH: the daemon is running a different build. Restart it.
+```
+
+A commit ending `-dirty` was built from an uncommitted tree.
+
+```bash
 hypr-music-bg doctor
 ```
 
-Prints detected monitors, the active player, the resolved wallpaper backend and
-the source chain. Start here.
+Prints detected monitors, the active player, the resolved wallpaper backend, the
+source chain, and the same build comparison. Start here.
 
 ```bash
 hypr-music-bg probe
