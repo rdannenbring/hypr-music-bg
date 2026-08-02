@@ -9,13 +9,15 @@ mod control;
 mod matching;
 mod monitors;
 mod mpris;
+mod theme;
 mod track;
+mod tray;
 mod util;
 
 use anyhow::{Context, Result};
 use art::Resolver;
 use backend::Wallpaper;
-use cache::Cache;
+use cache::{Cache, CacheLimits};
 use clap::{Parser, Subcommand};
 use config::{Config, Layout, RenderConfig, RenderStyle};
 use std::collections::HashMap;
@@ -23,6 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use theme::Theming;
 use tokio::sync::RwLock;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -202,6 +205,7 @@ struct Live {
     cfg: Config,
     resolver: Resolver,
     wallpaper: Wallpaper,
+    theming: Theming,
 }
 
 /// Everything the event loop needs.
@@ -212,7 +216,10 @@ struct App {
     /// playback can put back exactly that.
     original: HashMap<String, PathBuf>,
     /// Published for the CLI, the tray and the GUI.
-    status: RwLock<control::Status>,
+    ///
+    /// A std lock, not a tokio one: ksni's `Tray` methods are synchronous and
+    /// cannot await. Nothing holds this guard across an await point.
+    status: std::sync::RwLock<control::Status>,
     /// False means stay running but stop reacting to the player.
     enabled: AtomicBool,
     /// Remembered so `reload` reads the same file the daemon started with.
@@ -222,6 +229,12 @@ struct App {
     last_track: RwLock<Option<TrackInfo>>,
     /// Raised by `quit`, awaited by the run loop.
     shutdown: tokio::sync::Notify,
+    /// Bumped on any state change, so the tray can refresh its icon and menu.
+    ///
+    /// Not just artwork: the menu shows the enabled checkmark, the render radio
+    /// groups and the log level too, and dbusmenu clients cache the layout until
+    /// its revision changes. Anything altering Status must bump this.
+    state_generation: tokio::sync::watch::Sender<u64>,
 }
 
 impl App {
@@ -229,6 +242,7 @@ impl App {
         let cache = Cache::new(cfg.cache_dir())?;
         let resolver = Resolver::new(&cfg.art, cache.clone())?;
         let wallpaper = Wallpaper::new(&cfg.wallpaper).await?;
+        let theming = Theming::new(&cfg.theme, wallpaper.backend()).await;
 
         // Snapshot the wallpaper that was up before we ever touched anything.
         //
@@ -267,7 +281,10 @@ impl App {
             version: env!("CARGO_PKG_VERSION").to_string(),
             playback: "Unknown".into(),
             min_resolution: cfg.art.min_resolution,
+            render_style: render_style_name(cfg.render.style),
+            render_layout: layout_name(cfg.render.layout),
             backend: format!("{:?}", wallpaper.backend()),
+            theme_mode: format!("{:?}", theming.mode()),
             source_chain: resolver
                 .source_names()
                 .iter()
@@ -282,19 +299,101 @@ impl App {
                 cfg,
                 resolver,
                 wallpaper,
+                theming,
             }),
             cache,
             original,
-            status: RwLock::new(status),
+            status: std::sync::RwLock::new(status),
             enabled: AtomicBool::new(true),
             config_path,
             last_track: RwLock::new(None),
             shutdown: tokio::sync::Notify::new(),
+            state_generation: tokio::sync::watch::channel(0).0,
         })
     }
 
     fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Regenerate the desktop colour scheme from the artwork just applied.
+    ///
+    /// A no-op under `auto` when the wallpaper backend themes itself, which is
+    /// the common case on shells like DankMaterialShell.
+    async fn retheme(&self) {
+        let (cover, wallpaper) = {
+            let status = self.status.read().unwrap();
+            let cover = status
+                .art
+                .as_ref()
+                .and_then(|art| art.cache_path.clone())
+                .map(PathBuf::from);
+            let wallpaper = status.rendered.values().next().map(PathBuf::from);
+            (cover, wallpaper)
+        };
+
+        // Fall back to whichever is available: sampling the composed wallpaper
+        // is still better than skipping, and vice versa.
+        let (Some(cover), Some(wallpaper)) =
+            (cover.clone().or(wallpaper.clone()), wallpaper.or(cover))
+        else {
+            return;
+        };
+
+        self.live
+            .read()
+            .await
+            .theming
+            .apply(&cover, &wallpaper)
+            .await;
+    }
+
+    /// Size and age bounds from the current config.
+    async fn cache_limits(&self) -> CacheLimits {
+        let live = self.live.read().await;
+        CacheLimits {
+            max_bytes: live.cfg.art.cache_max_mb.saturating_mul(1024 * 1024),
+            max_age_secs: live.cfg.art.cache_max_age_days.saturating_mul(60 * 60 * 24),
+        }
+    }
+
+    /// Prune the cache, keeping whatever is currently on screen.
+    ///
+    /// The applied renders are excluded because the compositor holds their
+    /// paths rather than copies: deleting one does not cost a re-render, it
+    /// breaks the wallpaper that is up.
+    async fn prune_cache(&self) {
+        let limits = self.cache_limits().await;
+        if limits.max_bytes == 0 && limits.max_age_secs == 0 {
+            return;
+        }
+
+        let mut protected: std::collections::HashSet<PathBuf> = self
+            .status
+            .read()
+            .unwrap()
+            .rendered
+            .values()
+            .map(PathBuf::from)
+            .collect();
+        protected.extend(self.original.values().cloned());
+
+        let cache = self.cache.clone();
+        let freed = tokio::task::spawn_blocking(move || cache.prune(&limits, &protected))
+            .await
+            .unwrap_or_default();
+
+        if freed.removed > 0 {
+            let bytes = self.cache.total_bytes();
+            self.status.write().unwrap().cache_bytes = bytes;
+            self.notify_changed();
+        }
+    }
+
+    /// Tell anything mirroring `Status` that it changed.
+    fn notify_changed(&self) {
+        let next = *self.state_generation.borrow() + 1;
+        self.state_generation.send_replace(next);
     }
 
     /// Resolve art for a track, render it per monitor, and apply it.
@@ -308,7 +407,7 @@ impl App {
 
         *self.last_track.write().await = Some(track.clone());
         {
-            let mut status = self.status.write().await;
+            let mut status = self.status.write().unwrap();
             status.playback = "Playing".into();
             status.player = Some(track.player.clone());
             status.artist = Some(track.search_artist().to_string());
@@ -323,7 +422,7 @@ impl App {
         drop(live);
 
         {
-            let mut status = self.status.write().await;
+            let mut status = self.status.write().unwrap();
             status.chain = resolution.outcomes.clone();
             status.art = resolution.art.as_ref().map(|art| control::ArtStatus {
                 source: art.source.clone(),
@@ -369,8 +468,18 @@ impl App {
             },
         };
 
-        self.render_and_apply(&bytes, &format!("{}|{label}", track.album_key()), dry_run)
-            .await
+        self.notify_changed();
+        let result = self
+            .render_and_apply(&bytes, &format!("{}|{label}", track.album_key()), dry_run)
+            .await;
+
+        if !dry_run {
+            self.retheme().await;
+        }
+        // After, not before: the renders just applied are now in `status.rendered`
+        // and therefore protected from eviction.
+        self.prune_cache().await;
+        result
     }
 
     async fn render_and_apply(
@@ -426,13 +535,13 @@ impl App {
                     tracing::info!(monitor = %item.monitor, "wallpaper set");
                     self.status
                         .write()
-                        .await
+                        .unwrap()
                         .rendered
                         .insert(item.monitor.clone(), path.display().to_string());
                 }
                 Err(e) => {
                     tracing::error!(monitor = %item.monitor, error = %e, "failed to set wallpaper");
-                    self.status.write().await.last_error = Some(e.to_string());
+                    self.status.write().unwrap().last_error = Some(e.to_string());
                 }
             }
         }
@@ -549,7 +658,7 @@ impl control::Controller for App {
 
         match command {
             C::Status => {
-                let mut status = self.status.read().await.clone();
+                let mut status = self.status.read().unwrap().clone();
                 status.enabled = self.is_enabled();
                 status.cache_bytes = directory_size(self.cache.root());
                 Response::with_status(status)
@@ -610,16 +719,80 @@ impl control::Controller for App {
                     }
                 }
                 self.cache.save_originals(&originals);
+                self.status.write().unwrap().cache_bytes = directory_size(self.cache.root());
+                self.notify_changed();
                 Response::ok(format!("cleared {} KiB", freed / 1024))
             }
 
             C::LogLevel { level } => match set_log_level(&level) {
                 Ok(()) => {
-                    self.status.write().await.log_level = level.clone();
+                    self.status.write().unwrap().log_level = level.clone();
+                    self.notify_changed();
                     Response::ok(format!("log level set to {level}"))
                 }
                 Err(e) => Response::error(e.to_string()),
             },
+
+            C::Render { style, layout } => {
+                let mut live = self.live.write().await;
+                let mut changed = Vec::new();
+                if let Some(style) = &style {
+                    match style.to_ascii_lowercase().as_str() {
+                        "blur" => live.cfg.render.style = RenderStyle::Blur,
+                        "fill" => live.cfg.render.style = RenderStyle::Fill,
+                        "fit" => live.cfg.render.style = RenderStyle::Fit,
+                        other => return Response::error(format!("unknown render style {other:?}")),
+                    }
+                    changed.push(format!("style={style}"));
+                }
+                if let Some(layout) = &layout {
+                    match layout.to_ascii_lowercase().as_str() {
+                        "per_monitor" | "permonitor" => live.cfg.render.layout = Layout::PerMonitor,
+                        "span" => live.cfg.render.layout = Layout::Span,
+                        other => return Response::error(format!("unknown layout {other:?}")),
+                    }
+                    changed.push(format!("layout={layout}"));
+                }
+                let (style_name, layout_name_now) = (
+                    render_style_name(live.cfg.render.style),
+                    layout_name(live.cfg.render.layout),
+                );
+                drop(live);
+                {
+                    let mut status = self.status.write().unwrap();
+                    status.render_style = style_name;
+                    status.render_layout = layout_name_now;
+                }
+                self.notify_changed();
+
+                // Re-render immediately so the change is visible rather than
+                // waiting for the next album.
+                if let Some(track) = self.last_track.read().await.clone() {
+                    self.apply_for_track(&track, false).await.ok();
+                }
+                Response::ok(format!("{} (this session only)", changed.join(", ")))
+            }
+
+            C::Restart => {
+                // Under systemd, let the supervisor do it: re-execing would
+                // orphan the unit's accounting and lose Restart= semantics.
+                if std::env::var_os("INVOCATION_ID").is_some() {
+                    tracing::info!("restarting via systemd");
+                    self.restore().await.ok();
+                    match tokio::process::Command::new("systemctl")
+                        .args(["--user", "restart", "hypr-music-bg.service"])
+                        .spawn()
+                    {
+                        Ok(_) => Response::ok("restarting via systemd"),
+                        Err(e) => Response::error(format!("systemctl failed: {e}")),
+                    }
+                } else {
+                    Response::error(
+                        "not running under systemd; stop and start it again, \
+                         or install contrib/hypr-music-bg.service",
+                    )
+                }
+            }
 
             C::Quit => {
                 tracing::info!("quit requested over control socket");
@@ -637,7 +810,8 @@ impl control::Controller for App {
 impl App {
     async fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Relaxed);
-        self.status.write().await.enabled = enabled;
+        self.status.write().unwrap().enabled = enabled;
+        self.notify_changed();
         tracing::info!(enabled, "daemon toggled");
         if !enabled {
             // Disabled means the desktop should not keep showing our art.
@@ -650,11 +824,15 @@ impl App {
         let cfg = Config::load(self.config_path.as_deref())?;
         let resolver = Resolver::new(&cfg.art, self.cache.clone())?;
         let wallpaper = Wallpaper::new(&cfg.wallpaper).await?;
+        let theming = Theming::new(&cfg.theme, wallpaper.backend()).await;
 
         {
-            let mut status = self.status.write().await;
+            let mut status = self.status.write().unwrap();
             status.min_resolution = cfg.art.min_resolution;
+            status.render_style = render_style_name(cfg.render.style);
+            status.render_layout = layout_name(cfg.render.layout);
             status.backend = format!("{:?}", wallpaper.backend());
+            status.theme_mode = format!("{:?}", theming.mode());
             status.source_chain = resolver
                 .source_names()
                 .iter()
@@ -663,15 +841,36 @@ impl App {
         }
 
         // Swapped together, so the chain and the backend never disagree.
-        let mut live = self.live.write().await;
-        *live = Live {
-            cfg,
-            resolver,
-            wallpaper,
-        };
+        {
+            let mut live = self.live.write().await;
+            *live = Live {
+                cfg,
+                resolver,
+                wallpaper,
+                theming,
+            };
+        }
+        self.notify_changed();
         tracing::info!("config reloaded");
         Ok(())
     }
+}
+
+fn render_style_name(style: RenderStyle) -> String {
+    match style {
+        RenderStyle::Blur => "blur",
+        RenderStyle::Fill => "fill",
+        RenderStyle::Fit => "fit",
+    }
+    .into()
+}
+
+fn layout_name(layout: Layout) -> String {
+    match layout {
+        Layout::PerMonitor => "per_monitor",
+        Layout::Span => "span",
+    }
+    .into()
 }
 
 /// Total bytes under a directory, one level deep per subdirectory.
@@ -710,6 +909,9 @@ async fn run(cfg: Config, config_path: Option<PathBuf>) -> Result<()> {
         }
     });
 
+    app.prune_cache().await;
+    tray::spawn(app.clone()).await;
+
     let loop_app = app.clone();
     let watch = async move {
         let app = loop_app;
@@ -725,7 +927,7 @@ async fn run(cfg: Config, config_path: Option<PathBuf>) -> Result<()> {
                     let result = match event {
                         mpris::Event::Album(track) => app.apply_for_track(&track, false).await,
                         mpris::Event::Idle(status) => {
-                            app.status.write().await.playback = format!("{status:?}");
+                            app.status.write().unwrap().playback = format!("{status:?}");
                             let behavior = app.live.read().await.cfg.behavior.clone();
                             let should_restore = match status {
                                 PlaybackStatus::Paused => behavior.restore_on_pause,
@@ -742,7 +944,7 @@ async fn run(cfg: Config, config_path: Option<PathBuf>) -> Result<()> {
 
                     if let Err(e) = result {
                         tracing::error!(error = %e, "failed to handle event");
-                        app.status.write().await.last_error = Some(e.to_string());
+                        app.status.write().unwrap().last_error = Some(e.to_string());
                     }
                 }
             })
@@ -980,6 +1182,7 @@ fn print_status(s: &control::Status) {
     }
 
     println!("backend:  {}", s.backend);
+    println!("theming:  {}", s.theme_mode);
     println!("sources:  {}", s.source_chain.join(", "));
     println!("cache:    {} KiB", s.cache_bytes / 1024);
     println!("log:      {}", s.log_level);

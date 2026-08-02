@@ -48,6 +48,20 @@ fallback_wallpaper = "~/Pictures/wallpapers"
 # the chain and re-spend MusicBrainz's one-request-per-second budget.
 negative_cache_ttl = 86400
 
+# Size budget for cached art and rendered wallpapers, in MiB. 0 disables.
+#
+# Renders dominate: a two-monitor 1440p setup writes roughly 3 MB per album, so
+# an unbounded cache reaches gigabytes over a few months. Pruning takes the
+# oldest first, and never removes a wallpaper that is currently on screen — the
+# compositor holds the path rather than a copy, so evicting a live render would
+# break the wallpaper instead of merely costing a re-render. That exemption
+# means the total can sit slightly above the budget.
+cache_max_mb = 512
+
+# Drop entries older than this many days regardless of the size budget.
+# 0 disables.
+cache_max_age_days = 30
+
 
 # ---------------------------------------------------------------------------
 # Sources, in priority order. The chain stops at the first candidate that both
@@ -161,3 +175,29 @@ backend = "auto"
 [behavior]
 restore_on_pause = false
 restore_on_stop = true
+
+
+[theme]
+# Regenerate a desktop colour scheme from the artwork.
+#
+#   off      do nothing. The default, deliberately: recolouring GTK, the
+#            terminal and the browser on every album change is a far bigger
+#            intervention than setting a wallpaper, and installing a wallpaper
+#            tool is not consent for it.
+#   auto     do the right thing for this setup. Shells that already theme
+#            themselves from the wallpaper are left alone — DankMaterialShell
+#            binds its scheme to the wallpaper it was handed, so it has already
+#            re-themed by the time we could, and running matugen too would race
+#            it for the same template files. Otherwise: matugen if installed,
+#            else pywal.
+#   matugen  always run matugen
+#   pywal    always run wal -i <image> -n
+#   command  run your own, with {image} substituted
+mode = "off"
+
+# Which image to sample.
+#   cover      the artwork as fetched — purer colours
+#   wallpaper  the composed image on screen, blur and darkening included
+source = "cover"
+
+# command = "my-theme-script {image}"

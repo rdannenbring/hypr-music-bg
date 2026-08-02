@@ -44,10 +44,26 @@ pub enum Command {
     LogLevel {
         level: String,
     },
+    /// Change how art is composited, for the current session only.
+    ///
+    /// Session-only is deliberate: the tray can offer a fixed set of choices
+    /// but has nowhere to type a value, so persisting these belongs to the
+    /// settings GUI, which can rewrite the config file properly.
+    Render {
+        #[serde(default)]
+        style: Option<String>,
+        #[serde(default)]
+        layout: Option<String>,
+    },
+    /// Restart the process, via systemd when supervised.
+    Restart,
     Quit,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Also tolerant of unknown and missing fields, for the same version-skew
+/// reason as `Status`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Response {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,6 +100,7 @@ impl Response {
 
 /// What the art currently on screen is, and where it came from.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ArtStatus {
     pub source: String,
     pub width: u32,
@@ -99,14 +116,23 @@ pub struct ArtStatus {
 ///
 /// The whole design is a fallback chain, so "which source won, and why did the
 /// earlier ones not" is the single most useful thing to be able to see.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SourceOutcome {
     pub source: String,
     pub outcome: String,
 }
 
 /// A snapshot of the daemon, for the CLI, the tray, and the GUI.
+///
+/// `serde(default)` on the container is load-bearing, not decoration. This is a
+/// wire format between two processes that are updated independently: the daemon
+/// keeps running while `cargo build` replaces the binary the CLI invokes, so a
+/// newer client routinely talks to an older daemon. Without it, adding a single
+/// field makes every client command fail with a parse error against a daemon
+/// that predates it — which is exactly what adding `theme_mode` did.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Status {
     pub enabled: bool,
     pub version: String,
@@ -121,12 +147,17 @@ pub struct Status {
     pub chain: Vec<SourceOutcome>,
     pub source_chain: Vec<String>,
     pub min_resolution: u32,
+    /// Lowercase names matching the config values, for the tray's radio groups.
+    pub render_style: String,
+    pub render_layout: String,
 
     pub backend: String,
     /// Monitor name to the rendered PNG currently applied to it.
     pub rendered: BTreeMap<String, String>,
 
     pub cache_bytes: u64,
+    /// Resolved theming mode: what `auto` actually decided.
+    pub theme_mode: String,
     pub log_level: String,
     pub last_error: Option<String>,
 }
@@ -276,6 +307,32 @@ mod tests {
             Command::Refresh { bypass_cache } => assert!(!bypass_cache),
             other => panic!("expected Refresh, got {other:?}"),
         }
+    }
+
+    /// Version skew is the normal case, not an edge case: the daemon keeps
+    /// running while a rebuild replaces the binary the CLI invokes.
+    #[test]
+    fn a_newer_client_can_read_an_older_daemons_status() {
+        // A payload from a daemon that predates theme_mode, render_style and
+        // render_layout entirely.
+        let old = r#"{"enabled":true,"version":"0.1.0","playback":"Playing",
+                      "artist":"D12","album":"Devil's Night","min_resolution":600,
+                      "backend":"Dms","cache_bytes":1024,"log_level":"info"}"#;
+
+        let status: Status = serde_json::from_str(old).expect("must not fail on missing fields");
+        assert!(status.enabled);
+        assert_eq!(status.album.as_deref(), Some("Devil's Night"));
+        assert_eq!(status.theme_mode, "", "absent fields fall back to defaults");
+    }
+
+    /// And the reverse: an older client must survive fields it has never heard
+    /// of rather than refusing the whole response.
+    #[test]
+    fn an_older_client_ignores_fields_it_does_not_know() {
+        let future = r#"{"ok":true,"message":"done","some_future_field":42}"#;
+        let response: Response = serde_json::from_str(future).expect("must ignore unknown fields");
+        assert!(response.ok);
+        assert_eq!(response.message.as_deref(), Some("done"));
     }
 
     #[test]

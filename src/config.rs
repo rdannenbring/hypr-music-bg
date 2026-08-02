@@ -17,6 +17,49 @@ pub struct Config {
     pub wallpaper: WallpaperConfig,
     #[serde(default)]
     pub behavior: BehaviorConfig,
+    #[serde(default)]
+    pub theme: ThemeConfig,
+}
+
+/// Regenerating a desktop colour scheme from the artwork.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ThemeConfig {
+    #[serde(default)]
+    pub mode: ThemeMode,
+    #[serde(default)]
+    pub source: ThemeSource,
+    /// For `mode = "command"`. `{image}` is substituted.
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
+    /// Do nothing. The default, deliberately.
+    ///
+    /// Recolouring GTK, the terminal, the browser and everything else on every
+    /// album change is a far larger intervention than setting a wallpaper, and
+    /// nobody installing a wallpaper tool has asked for it. Opt in.
+    #[default]
+    Off,
+    /// Skip when the wallpaper backend already themes itself, otherwise use
+    /// whatever is installed.
+    Auto,
+    Matugen,
+    Pywal,
+    Command,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeSource {
+    /// The artwork as fetched: purer colours.
+    #[default]
+    Cover,
+    /// The composed wallpaper: what is actually on screen, blur included.
+    Wallpaper,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -86,6 +129,17 @@ pub struct ArtConfig {
     /// does not re-walk the whole chain and burn rate-limited lookups. 0 disables.
     #[serde(default = "default_negative_ttl")]
     pub negative_cache_ttl: u64,
+    /// Size budget for cached art and rendered wallpapers, in MiB. 0 disables.
+    ///
+    /// Rendered wallpapers dominate: a two-monitor 1440p setup writes roughly
+    /// 3 MB per album, so an unbounded cache reaches gigabytes over a few
+    /// months of listening.
+    #[serde(default = "default_cache_max_mb")]
+    pub cache_max_mb: u64,
+    /// Drop entries older than this many days regardless of the size budget.
+    /// 0 disables.
+    #[serde(default = "default_cache_max_age_days")]
+    pub cache_max_age_days: u64,
     /// Sources in priority order.
     #[serde(default = "default_sources", rename = "source")]
     pub sources: Vec<SourceConfig>,
@@ -99,6 +153,12 @@ fn default_match_threshold() -> f64 {
 }
 fn default_negative_ttl() -> u64 {
     60 * 60 * 24
+}
+fn default_cache_max_mb() -> u64 {
+    512
+}
+fn default_cache_max_age_days() -> u64 {
+    30
 }
 fn default_true() -> bool {
     true
@@ -125,6 +185,8 @@ impl Default for ArtConfig {
             fallback_wallpaper: None,
             cache_dir: None,
             negative_cache_ttl: default_negative_ttl(),
+            cache_max_mb: default_cache_max_mb(),
+            cache_max_age_days: default_cache_max_age_days(),
             sources: default_sources(),
         }
     }
