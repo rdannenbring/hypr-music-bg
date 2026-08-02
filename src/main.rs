@@ -1,12 +1,11 @@
 //! hypr-music-bg — set the currently playing track's album art as your wallpaper.
 
+use hypr_music_bg::{build_info, config, control};
+
 mod art;
 mod backend;
-mod build_info;
 mod cache;
 mod compose;
-mod config;
-mod control;
 mod matching;
 mod monitors;
 mod mpris;

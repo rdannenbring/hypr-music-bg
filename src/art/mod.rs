@@ -19,12 +19,12 @@ pub mod spotify;
 pub mod subsonic;
 
 use crate::cache::Cache;
-use crate::config::{ArtConfig, SourceConfig};
-use crate::control::SourceOutcome;
 use crate::matching;
 use crate::track::TrackInfo;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use hypr_music_bg::config::{ArtConfig, SourceConfig};
+use hypr_music_bg::control::SourceOutcome;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -33,6 +33,7 @@ Verified end-to-end on real hardware:
   never evicted — measured against a real 126 MB cache
 - The acceptance policy itself: fallthrough, degradation, match rejection,
   deferred candidates, and both cache short circuits
+- Config editing that preserves comments, including source-chain reordering
 
 **Implemented but never executed against a live service** — no credentials, so
 no real call has been made. Treat as unproven:
@@ -54,7 +55,7 @@ Known gaps:
   handled. Parsing `Artist - Title` out of stream titles is planned.
 - No monitor hotplug handling for the captured original wallpaper.
 
-Roadmap, roughly in order: a settings GUI, stream title parsing, packaging.
+Roadmap, roughly in order: stream title parsing, packaging.
 
 Resolution currently takes about 2.7 s cold and 0.4 s warm, of which roughly
 2.3 s is network — a MusicBrainz query plus Cover Art Archive's redirect chain.
@@ -132,6 +133,16 @@ records by the same act.
 cargo build --release
 install -Dm755 target/release/hypr-music-bg ~/.local/bin/hypr-music-bg
 ```
+
+The settings window is a separate binary behind an optional feature, so the
+always-running daemon does not link a UI toolkit it never uses:
+
+```bash
+cargo build --release --features gui
+install -Dm755 target/release/hypr-music-bg-settings ~/.local/bin/hypr-music-bg-settings
+```
+
+The tray shows a **Settings…** entry only when that binary is actually present.
 
 ```bash
 mkdir -p ~/.config/hypr-music-bg && cp config.example.toml ~/.config/hypr-music-bg/config.toml
@@ -242,6 +253,25 @@ WantedBy=graphical-session.target
 ```bash
 systemctl --user enable --now hypr-music-bg.service
 ```
+
+## Settings window
+
+`hypr-music-bg-settings`, or **Settings…** in the tray. It edits the config file
+and then asks the daemon to reload, so the file on disk stays the source of
+truth rather than the GUI holding a second, divergent copy of your settings.
+
+Edits are surgical. The config is rewritten with `toml_edit`, which preserves
+comments, ordering and formatting — a serialize-and-write would delete all 128
+comments in the shipped example, which is where most of the explanation of what
+the settings *mean* lives.
+
+It covers the source chain (reorder, add, remove, per-source size), the
+resolution floor and matching, cache bounds, render style and layout, the
+wallpaper backend, theming, player filters, and restore behaviour. A live panel
+on the right shows what the daemon is doing, including the last chain walk.
+
+Credential-backed sources are referenced by environment variable name and are
+not editable here — the GUI never handles a secret.
 
 ## Colour theming
 

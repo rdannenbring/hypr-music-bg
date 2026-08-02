@@ -5,7 +5,33 @@ edition = "2024"
 description = "Set the currently playing track's album art as your Wayland wallpaper"
 license = "MIT"
 
+[features]
+# The settings GUI is opt-in so the daemon does not link a UI toolkit it never
+# uses: the daemon is ~11 MB and ~10 MB resident, and egui would change both.
+gui = ["dep:eframe", "dep:egui"]
+
+[lib]
+name = "hypr_music_bg"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hypr-music-bg"
+path = "src/main.rs"
+
+[[bin]]
+name = "hypr-music-bg-settings"
+path = "src/bin/settings.rs"
+required-features = ["gui"]
+
 [dependencies]
+toml_edit = "0.25"
+eframe = { version = "0.35", optional = true, default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui = { version = "0.35", optional = true }
 anyhow = "1.0"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }

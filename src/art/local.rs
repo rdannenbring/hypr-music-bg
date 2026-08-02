@@ -7,11 +7,11 @@
 //! neither carries a claim.
 
 use super::{ArtRef, ArtSource, Ctx, Locator};
-use crate::config::expand_tilde;
 use crate::track::TrackInfo;
 use crate::util;
 use anyhow::Result;
 use async_trait::async_trait;
+use hypr_music_bg::config::expand_tilde;
 use std::path::{Path, PathBuf};
 
 const STEMS: [&str; 7] = [

@@ -19,7 +19,7 @@
 //! user would not otherwise have; on DMS it means nothing new, because they
 //! already had it.
 
-use crate::config::{Backend, ThemeConfig, ThemeMode, ThemeSource};
+use hypr_music_bg::config::{Backend, ThemeConfig, ThemeMode, ThemeSource};
 use std::path::Path;
 
 pub struct Theming {
@@ -168,7 +168,7 @@ mod tests {
     /// installed a wallpaper tool and accepted the defaults.
     #[test]
     fn theming_is_off_unless_asked_for() {
-        let cfg: crate::config::Config = toml::from_str("").unwrap();
+        let cfg: hypr_music_bg::config::Config = toml::from_str("").unwrap();
         assert_eq!(cfg.theme.mode, ThemeMode::Off);
     }
 
