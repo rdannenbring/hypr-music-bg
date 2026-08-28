@@ -4,8 +4,8 @@
 //! interface, so each gets a small adapter and `Backend::Auto` probes for
 //! whichever is actually running.
 
-use crate::config::{Backend, WallpaperConfig};
 use anyhow::{Context, Result, anyhow};
+use hypr_music_bg::config::{Backend, WallpaperConfig};
 use std::path::{Path, PathBuf};
 
 pub struct Wallpaper {

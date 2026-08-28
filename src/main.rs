@@ -1,11 +1,11 @@
 //! hypr-music-bg — set the currently playing track's album art as your wallpaper.
 
+use hypr_music_bg::{build_info, config, control};
+
 mod art;
 mod backend;
 mod cache;
 mod compose;
-mod config;
-mod control;
 mod matching;
 mod monitors;
 mod mpris;
@@ -17,6 +17,7 @@ mod util;
 use anyhow::{Context, Result};
 use art::Resolver;
 use backend::Wallpaper;
+use build_info::{BuildInfo, BuildMatch};
 use cache::{Cache, CacheLimits};
 use clap::{Parser, Subcommand};
 use config::{Config, Layout, RenderConfig, RenderStyle};
@@ -97,6 +98,8 @@ enum Command {
     Probe,
     /// Print detected monitors, players, sources and the wallpaper backend.
     Doctor,
+    /// Print this binary's version and build, and the running daemon's.
+    About,
 
     // --- these talk to a running daemon over the control socket ---
     /// Show what the running daemon is doing.
@@ -162,6 +165,9 @@ async fn main() -> Result<()> {
     if let Some(forwarded) = as_control_command(&command) {
         return control_client(forwarded).await;
     }
+    if matches!(command, Command::About) {
+        return about().await;
+    }
 
     let cfg = Config::load(cli.config.as_deref())?;
     let config_path = cli.config.clone();
@@ -171,7 +177,7 @@ async fn main() -> Result<()> {
         Command::Once { dry_run } => once(cfg, config_path, dry_run).await,
         Command::Probe => probe(cfg).await,
         Command::Doctor => doctor(cfg).await,
-        _ => unreachable!("client subcommands are forwarded above"),
+        _ => unreachable!("handled before config loading"),
     }
 }
 
@@ -192,7 +198,9 @@ fn as_control_command(command: &Command) -> Option<control::Command> {
             level: level.clone(),
         },
         Command::Quit => control::Command::Quit,
-        Command::Run | Command::Once { .. } | Command::Probe | Command::Doctor => return None,
+        Command::Run | Command::Once { .. } | Command::Probe | Command::Doctor | Command::About => {
+            return None;
+        }
     })
 }
 
@@ -279,6 +287,7 @@ impl App {
         let status = control::Status {
             enabled: true,
             version: env!("CARGO_PKG_VERSION").to_string(),
+            build: BuildInfo::current(),
             playback: "Unknown".into(),
             min_resolution: cfg.art.min_resolution,
             render_style: render_style_name(cfg.render.style),
@@ -905,7 +914,7 @@ async fn run(cfg: Config, config_path: Option<PathBuf>) -> Result<()> {
     let control_app = app.clone();
     let control = tokio::spawn(async move {
         if let Err(e) = control::serve(control_app).await {
-            tracing::error!(error = %e, "control socket unavailable");
+            tracing::error!(error = format!("{e:#}"), "control socket unavailable");
         }
     });
 
@@ -1041,6 +1050,11 @@ async fn probe(cfg: Config) -> Result<()> {
 }
 
 async fn doctor(cfg: Config) -> Result<()> {
+    let mine = BuildInfo::current();
+    println!("build:    {}", mine.summary());
+    if let Some(exe) = &mine.exe {
+        println!("  path:   {exe}");
+    }
     println!("config:   {}", config::default_config_path().display());
     println!("cache:    {}", cfg.cache_dir().display());
     println!("socket:   {}", control::socket_path().display());
@@ -1110,8 +1124,76 @@ async fn doctor(cfg: Config) -> Result<()> {
 
     println!();
     match control::send(&control::Command::Status).await {
-        Ok(_) => println!("daemon:   running"),
+        Ok(response) => {
+            println!("daemon:   running");
+            if let Some(status) = response.status {
+                if status.build.commit.is_empty() {
+                    println!("  build:  predates build stamping - restart it");
+                } else {
+                    println!("  build:  {}", status.build.summary());
+                }
+                if let Some(exe) = &status.build.exe {
+                    println!("  path:   {exe}");
+                }
+                match mine.compare(&status.build) {
+                    BuildMatch::Same => {}
+                    BuildMatch::Indeterminate => {
+                        println!("  ^ built from an uncommitted tree; cannot confirm it matches")
+                    }
+                    BuildMatch::Different => {
+                        println!("  ^ MISMATCH with this binary; restart the daemon")
+                    }
+                }
+            }
+        }
         Err(_) => println!("daemon:   not running"),
+    }
+
+    Ok(())
+}
+
+/// Show this binary's build and the running daemon's, and say plainly when they
+/// disagree.
+///
+/// The disagreement is the whole point: a daemon started before a rebuild keeps
+/// running the old code, and nothing about its behaviour announces that. This
+/// session lost time to it three times.
+async fn about() -> Result<()> {
+    let mine = BuildInfo::current();
+    println!("this binary");
+    println!("  {}", mine.summary());
+    println!("  branch: {}", mine.branch);
+    if let Some(exe) = &mine.exe {
+        println!("  path:   {exe}");
+    }
+    println!();
+
+    match control::send(&control::Command::Status).await {
+        Ok(response) => {
+            let Some(status) = response.status else {
+                println!("running daemon\n  responded without a status");
+                return Ok(());
+            };
+            let theirs = &status.build;
+            println!("running daemon");
+            if theirs.commit.is_empty() {
+                println!("  predates build stamping (older than this feature)");
+            } else {
+                println!("  {}", theirs.summary());
+                println!("  branch: {}", theirs.branch);
+            }
+            if let Some(exe) = &theirs.exe {
+                println!("  path:   {exe}");
+            }
+            println!();
+
+            if theirs.commit.is_empty() {
+                println!("MISMATCH: the daemon predates build stamping. Restart it.");
+            } else {
+                println!("{}", mine.compare(theirs).message());
+            }
+        }
+        Err(_) => println!("running daemon\n  none (no daemon listening)"),
     }
 
     Ok(())
@@ -1137,7 +1219,7 @@ async fn control_client(command: control::Command) -> Result<()> {
 
 fn print_status(s: &control::Status) {
     println!("enabled:  {}", s.enabled);
-    println!("version:  {}", s.version);
+    println!("build:    {}", s.build.summary());
     println!("playback: {}", s.playback);
     if let Some(player) = &s.player {
         println!("player:   {player}");

@@ -4,10 +4,10 @@
 //! existing tool in this space busy-loops on `playerctl metadata`, which burns
 //! CPU all session to notice a change that D-Bus would have pushed.
 
-use crate::config::PlayerConfig;
 use crate::track::{PlaybackStatus, TrackInfo};
 use anyhow::Result;
 use futures_util::StreamExt;
+use hypr_music_bg::config::PlayerConfig;
 use std::collections::HashMap;
 use zbus::Connection;
 use zbus::zvariant::{OwnedValue, Value};

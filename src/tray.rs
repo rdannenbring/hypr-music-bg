@@ -19,7 +19,7 @@
 //! and defers the rest to the config file or the settings GUI.
 
 use crate::App;
-use crate::control::{Command, Controller, Status};
+use hypr_music_bg::control::{Command, Controller, Status};
 use ksni::menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem, SubMenu};
 use ksni::{Icon, MenuItem, ToolTip, Tray, TrayMethods};
 use std::sync::Arc;
@@ -385,7 +385,6 @@ impl Tray for MusicTray {
 
         // --- diagnostics -------------------------------------------------
         let mut diagnostics: Vec<MenuItem<MusicTray>> = Vec::new();
-        diagnostics.push(label(format!("Version: {}", status.version)));
         diagnostics.push(label(format!("Backend: {}", status.backend)));
         diagnostics.push(label(format!("Theming: {}", status.theme_mode)));
         diagnostics.push(label(format!(
@@ -452,11 +451,77 @@ impl Tray for MusicTray {
             Command::ClearCache,
         ));
 
-        let config_path = crate::config::default_config_path();
+        // The settings GUI is a separate binary behind an optional feature, so it
+        // may simply not be installed. Offer it only when it is actually there,
+        // rather than showing an entry that does nothing.
+        if let Some(settings) = settings_binary() {
+            items.push(
+                StandardItem {
+                    label: "Settings…".into(),
+                    activate: Box::new(move |_| {
+                        if let Err(e) = std::process::Command::new(&settings)
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn()
+                        {
+                            tracing::warn!(error = %e, "could not launch the settings window");
+                        }
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+
+        let config_path = hypr_music_bg::config::default_config_path();
         items.push(
             StandardItem {
                 label: "Edit config…".into(),
                 activate: Box::new(move |_| open_path(&config_path.display().to_string())),
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        // --- about --------------------------------------------------------
+        //
+        // No build comparison here, unlike `about` on the command line: the tray
+        // runs *inside* the daemon, so what it reports is by definition the
+        // build that is running. There is nothing it could disagree with.
+        let mut about: Vec<MenuItem<MusicTray>> = vec![
+            label(format!("hypr-music-bg {}", status.build.version)),
+            label(format!("commit {}", status.build.commit)),
+            label(format!("branch {}", status.build.branch)),
+            label(format!("built  {}", status.build.built)),
+        ];
+        if status.build.commit.ends_with("-dirty") {
+            about.push(label("⚠ built from an uncommitted tree"));
+        }
+        if let Some(exe) = &status.build.exe {
+            about.push(MenuItem::Separator);
+            about.push(label(shorten(exe)));
+            let open = exe.clone();
+            about.push(
+                StandardItem {
+                    label: "Show binary in file manager".into(),
+                    activate: Box::new(move |_| {
+                        // The parent directory: opening the executable itself
+                        // would try to run it.
+                        let dir = std::path::Path::new(&open)
+                            .parent()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| open.clone());
+                        open_path(&dir)
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        items.push(
+            SubMenu {
+                label: "About".into(),
+                submenu: about,
                 ..Default::default()
             }
             .into(),
@@ -468,6 +533,34 @@ impl Tray for MusicTray {
 
         items
     }
+}
+
+/// Locate the settings GUI, if it is installed.
+///
+/// Checks beside the running executable first so a development build finds its
+/// sibling in `target/release` rather than an older copy installed on PATH —
+/// the same staleness trap that made build stamping necessary.
+fn settings_binary() -> Option<std::path::PathBuf> {
+    const NAME: &str = "hypr-music-bg-settings";
+
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let sibling = dir.join(NAME);
+        if sibling.is_file() {
+            return Some(sibling);
+        }
+    }
+
+    let output = std::process::Command::new("sh")
+        .args(["-c", &format!("command -v {NAME}")])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    path.is_file().then_some(path)
 }
 
 /// Hand a path or URL to the desktop's default handler.

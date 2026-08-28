@@ -1,8 +1,8 @@
 //! Turning a square cover into a screen-shaped wallpaper.
 
-use crate::config::{Layout, RenderConfig, RenderStyle};
 use crate::monitors::{self, Monitor};
 use anyhow::Result;
+use hypr_music_bg::config::{Layout, RenderConfig, RenderStyle};
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
 
