@@ -511,6 +511,9 @@ impl App {
     ) -> Result<()> {
         let monitors = monitors::detect().await?;
 
+        // Taken before the config moves into the render task below.
+        let fingerprint = render_cfg.fingerprint();
+
         // Rendering is CPU-bound and would otherwise stall the D-Bus loop.
         let art = art_bytes.to_vec();
         let render_cfg = render_cfg.clone();
@@ -521,9 +524,10 @@ impl App {
                 .context("render task panicked")??;
 
         for item in rendered {
+            // The render config is part of the key: see RenderConfig::fingerprint.
             let path = self
                 .cache
-                .render_path(&format!("{cache_key}|{}", item.monitor));
+                .render_path(&format!("{cache_key}|{fingerprint}|{}", item.monitor));
             cache::write_atomic(&path, &item.png)
                 .with_context(|| format!("writing {}", path.display()))?;
 
@@ -861,25 +865,29 @@ impl App {
         }
         self.notify_changed();
         tracing::info!("config reloaded");
+
+        // Re-render now rather than at the next album change. Reload exists to
+        // make an edited config take effect, and a render style that only
+        // arrives with the next record reads as the save having failed — which
+        // is exactly how it was reported. The tray's style switch already does
+        // this for the same reason; reload was the path that did not.
+        let current = self.last_track.read().await.clone();
+        if let Some(track) = current.filter(|_| self.is_enabled())
+            && let Err(e) = self.apply_for_track(&track, false).await
+        {
+            // The config did load, so this is not a failed reload.
+            tracing::warn!(error = %e, "config reloaded but re-rendering failed");
+        }
         Ok(())
     }
 }
 
 fn render_style_name(style: RenderStyle) -> String {
-    match style {
-        RenderStyle::Blur => "blur",
-        RenderStyle::Fill => "fill",
-        RenderStyle::Fit => "fit",
-    }
-    .into()
+    style.as_str().into()
 }
 
 fn layout_name(layout: Layout) -> String {
-    match layout {
-        Layout::PerMonitor => "per_monitor",
-        Layout::Span => "span",
-    }
-    .into()
+    layout.as_str().into()
 }
 
 /// Total bytes under a directory, one level deep per subdirectory.
