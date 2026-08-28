@@ -55,7 +55,8 @@ Known gaps:
   handled. Parsing `Artist - Title` out of stream titles is planned.
 - No monitor hotplug handling for the captured original wallpaper.
 
-Roadmap, roughly in order: stream title parsing, packaging.
+Roadmap, open tasks and known traps: [docs/TASKS.md](docs/TASKS.md).
+Why the project is shaped this way: [docs/DESIGN.md](docs/DESIGN.md).
 
 Resolution currently takes about 2.7 s cold and 0.4 s warm, of which roughly
 2.3 s is network — a MusicBrainz query plus Cover Art Archive's redirect chain.
