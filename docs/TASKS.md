@@ -1,6 +1,7 @@
 # Tasks
 
-Status as of `main` at `ea1fe90` (PRs #1 and #2 merged).
+Status as of `main` at `ab98ff6`, plus the swaybg fix on
+`fix/swaybg-multi-monitor`.
 
 Design rationale for anything below lives in [DESIGN.md](DESIGN.md).
 
@@ -52,8 +53,14 @@ Design rationale for anything below lives in [DESIGN.md](DESIGN.md).
 ## Verified on real hardware
 
 - `mpris`, `local`, `coverartarchive`, `deezer`
+- `itunes` — live Search API call, 1200×1200 accepted after verification
+- `exec` — receives `HMB_ARTIST`, `HMB_ALBUM_ARTIST`, `HMB_ALBUM`, `HMB_TITLE`
+  and configured `args`; a non-zero exit reads as "nothing found", not an error
+- `subsonic` — live Navidrome call, md5-salt auth, 300×300 accepted. That is the
+  native size, so behind the 600px floor it correctly falls through
 - The acceptance policy, including fallthrough and degradation
 - DankMaterialShell backend
+- `swaybg` backend, against a nested compositor with two outputs
 - Per-monitor and spanning layouts on two 2560×1440 displays
 - Album change, pause, stop, resume
 - Control socket and every CLI subcommand
@@ -67,15 +74,25 @@ Design rationale for anything below lives in [DESIGN.md](DESIGN.md).
 
 Ranked by how likely they are to bite. **This is the top of the work queue.**
 
-1. ~~**Tray album-art icon.**~~ **VERIFIED WORKING** — the cover renders in the
-   bar. ARGB channel order is correct.
-2. **Six credential-backed sources** — `spotify`, `discogs`, `fanarttv`,
-   `subsonic`, `itunes`, `exec`. URL construction, auth shape and response
-   parsing are unit-tested; no live call has ever been made.
-3. **`swww`, `hyprpaper`, `swaybg` backends.** Implemented, never exercised.
-4. **Settings GUI in real use.** It launches, renders, and leaves the config
+1. **Settings GUI in real use.** It launches, renders, and leaves the config
    untouched on open — but no setting has been changed through it and saved on a
    live system.
+2. **Three key-requiring sources** — `spotify`, `discogs`, `fanarttv`. URL
+   construction, auth shape and response parsing are unit-tested; no live call
+   has been made. Each needs an account and an API key.
+3. **`swww` and `hyprpaper` backends.** Implemented, never exercised, and
+   neither binary is installed on this machine.
+4. **iTunes' rejection path.** The accept path is verified, but the failure mode
+   that makes iTunes dangerous — a confident wrong album, as recorded in
+   DESIGN.md — has never been seen rejected in a live run. Needs an album iTunes
+   does not carry, playing.
+
+Previously here, now resolved:
+
+- ~~**Tray album-art icon.**~~ Verified: the cover renders in the bar, ARGB
+  channel order correct.
+- ~~**`itunes`, `exec`, `subsonic`.**~~ Verified live; see above.
+- ~~**`swaybg` backend.**~~ Verified, and it was broken — see below.
 
 ---
 
@@ -84,18 +101,22 @@ Ranked by how likely they are to bite. **This is the top of the work queue.**
 ### Next
 - [x] Merge the branch stack into `main` — done, PRs #1 and #2
 - [x] Verify the tray icon renders — working
-- [ ] Install the current build so the running daemon matches the source
-- [ ] Verify the six credential-backed sources against live services
-- [ ] Verify `swww` / `hyprpaper` / `swaybg` backends
+- [x] Verify `itunes`, `exec` and `subsonic` against live services
+- [x] Verify the `swaybg` backend — found and fixed a multi-monitor bug
+- [ ] Install the build carrying the swaybg fix; `~/.local/bin` is stale again
+- [ ] Verify `spotify` / `discogs` / `fanarttv` — blocked on API keys
+- [ ] Verify `swww` / `hyprpaper` — blocked on `pacman -S swww hyprpaper`
 - [ ] Change a setting in the GUI, save, confirm the daemon picks it up
 
 ### Roadmap
 - [ ] **Stream title parsing** — derive artist and album from `Artist - Title`
       in `xesam:title`. Must run *before* `is_searchable()`, so a normalised
       stream passes the existing gate rather than each source special-casing it.
-- [ ] **Packaging** — PKGBUILD, and a systemd unit installed rather than an
-      autostart `.desktop` (which also makes the tray's Restart work, since it
-      needs `INVOCATION_ID`)
+- [ ] **Packaging** — PKGBUILD. The systemd unit half is already done in
+      practice: `~/.config/systemd/user/hypr-music-bg.service` is what runs the
+      daemon on this machine, which is also why the tray's Restart works
+      (it needs `INVOCATION_ID`). What remains is shipping that unit with the
+      package instead of it being a hand-written local file.
 - [ ] **Resolve latency** — 2740 ms cold, 417 ms warm. About 2.3 s is network: a
       MusicBrainz query plus Cover Art Archive's redirect chain through
       archive.org. Levers: put Deezer ahead of CAA (one hop to a fast CDN versus
@@ -113,11 +134,12 @@ Ranked by how likely they are to bite. **This is the top of the work queue.**
 
 ## Branch state
 
-All merged. `main` at `ea1fe90`, no feature branches, no open PRs.
+`main` at `ab98ff6`. One open branch: `fix/swaybg-multi-monitor`.
 
 - PR #1 (`feat/theming`) — tray, cache eviction, resolver tests, theming,
   version-skew fix
 - PR #2 (`feat/settings-gui`) — build stamping, tray About, settings window, docs
+- `fix/swaybg-multi-monitor` — per-monitor swaybg process tracking
 
 ---
 
@@ -134,3 +156,9 @@ Recorded because each cost real time.
   file counts read two higher than reality.
 - **Unix socket paths cap near 108 bytes.** Long `XDG_RUNTIME_DIR` values fail to
   bind; now checked up front with an explanatory message.
+- **A backend can report success and still leave a monitor black.** swaybg did
+  exactly this. "wallpaper set" in the log means the command was issued, not
+  that anything is on screen — so backend verification has to look at the
+  screen, not the log. A nested Hyprland (`Hyprland -c <minimal.conf>`, then
+  `hyprctl output create headless`) gives two outputs to test against without
+  touching the real session, and `grim -o <output>` captures the proof.
