@@ -1,6 +1,6 @@
 # Tasks
 
-Status as of the `feat/settings-gui` branch (`4bf159f`).
+Status as of `main` at `ea1fe90` (PRs #1 and #2 merged).
 
 Design rationale for anything below lives in [DESIGN.md](DESIGN.md).
 
@@ -65,11 +65,10 @@ Design rationale for anything below lives in [DESIGN.md](DESIGN.md).
 
 ## Unverified
 
-Ranked by how likely they are to bite.
+Ranked by how likely they are to bite. **This is the top of the work queue.**
 
-1. **Tray album-art icon.** Never rendered into a bar. The ARGB conversion has a
-   test, but the end-to-end path has never run. Getting the channel order wrong
-   produces a corrupt-looking icon rather than an obvious failure.
+1. ~~**Tray album-art icon.**~~ **VERIFIED WORKING** — the cover renders in the
+   bar. ARGB channel order is correct.
 2. **Six credential-backed sources** — `spotify`, `discogs`, `fanarttv`,
    `subsonic`, `itunes`, `exec`. URL construction, auth shape and response
    parsing are unit-tested; no live call has ever been made.
@@ -83,9 +82,12 @@ Ranked by how likely they are to bite.
 ## Pending
 
 ### Next
-- [ ] Merge the branch stack into `main` (see below)
+- [x] Merge the branch stack into `main` — done, PRs #1 and #2
+- [x] Verify the tray icon renders — working
 - [ ] Install the current build so the running daemon matches the source
-- [ ] Verify the tray icon renders
+- [ ] Verify the six credential-backed sources against live services
+- [ ] Verify `swww` / `hyprpaper` / `swaybg` backends
+- [ ] Change a setting in the GUI, save, confirm the daemon picks it up
 
 ### Roadmap
 - [ ] **Stream title parsing** — derive artist and album from `Artist - Title`
@@ -111,20 +113,11 @@ Ranked by how likely they are to bite.
 
 ## Branch state
 
-Six branches, stacked. Merging `feat/settings-gui` brings all of them.
+All merged. `main` at `ea1fe90`, no feature branches, no open PRs.
 
-```
-main                 ff9c811
- └ feat/tray            db2caaa  tray + dbusmenu
-   └ feat/cache-eviction  5a77dd4  cache size and age bounds
-     └ test/resolver-policy 3a1250c  11 acceptance-policy tests
-       └ feat/theming        91b626f  theming + version-skew fix
-         └ feat/about          997d0b1  build stamping + tray About
-           └ feat/settings-gui   4bf159f  settings window
-```
-
-PR #1 was opened from `feat/theming`; confirm whether it merged or closed before
-opening another.
+- PR #1 (`feat/theming`) — tray, cache eviction, resolver tests, theming,
+  version-skew fix
+- PR #2 (`feat/settings-gui`) — build stamping, tray About, settings window, docs
 
 ---
 

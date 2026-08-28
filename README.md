@@ -34,6 +34,7 @@ Verified end-to-end on real hardware:
 - The acceptance policy itself: fallthrough, degradation, match rejection,
   deferred candidates, and both cache short circuits
 - Config editing that preserves comments, including source-chain reordering
+- The tray's album-art icon rendering in a real bar
 
 **Implemented but never executed against a live service** — no credentials, so
 no real call has been made. Treat as unproven:
@@ -42,9 +43,6 @@ no real call has been made. Treat as unproven:
 
 Their URL construction, auth shape and response parsing are unit-tested, but
 "compiles and parses a fixture" is not "works".
-
-The tray's **album-art icon** is in the same category: the ARGB conversion has a
-test, but no cover has actually been rendered into a bar yet.
 
 Known gaps:
 
