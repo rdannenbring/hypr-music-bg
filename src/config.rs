@@ -323,6 +323,29 @@ pub struct RenderConfig {
     pub darken: f32,
 }
 
+impl RenderConfig {
+    /// A short digest of everything that changes the rendered pixels.
+    ///
+    /// This belongs in the render cache key because a wallpaper is handed to
+    /// the compositor as a *path*, not as bytes. Writing a differently styled
+    /// render to the same filename leaves a path-keyed backend — DMS and swww
+    /// both are — showing the image it already had, so switching style appeared
+    /// to do nothing until the path changed for some other reason. Changing the
+    /// rendering has to change the filename.
+    pub fn fingerprint(&self) -> String {
+        // Fixed precision keeps the key stable: the same configured value must
+        // not produce two spellings and therefore two cache entries.
+        format!(
+            "{}-{}-{:.3}-{:.3}-{:.3}",
+            self.style.as_str(),
+            self.layout.as_str(),
+            self.cover_scale,
+            self.blur_strength,
+            self.darken
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RenderStyle {
@@ -335,12 +358,31 @@ pub enum RenderStyle {
     Fit,
 }
 
+impl RenderStyle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Blur => "blur",
+            Self::Fill => "fill",
+            Self::Fit => "fit",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Layout {
     #[default]
     PerMonitor,
     Span,
+}
+
+impl Layout {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PerMonitor => "per_monitor",
+            Self::Span => "span",
+        }
+    }
 }
 
 fn default_cover_scale() -> f32 {
@@ -516,5 +558,64 @@ mod tests {
     fn typos_are_rejected_rather_than_silently_ignored() {
         let err = toml::from_str::<Config>("[art]\nmin_resolutoin = 900\n");
         assert!(err.is_err());
+    }
+
+    /// Every field of the render config changes the pixels, so every field has
+    /// to change the fingerprint — otherwise a differently rendered wallpaper
+    /// lands on the path the compositor is already showing and nothing moves.
+    #[test]
+    fn every_render_setting_changes_the_fingerprint() {
+        let base = RenderConfig::default();
+        let baseline = base.fingerprint();
+
+        let variants = [
+            RenderConfig {
+                style: RenderStyle::Fill,
+                ..base.clone()
+            },
+            RenderConfig {
+                style: RenderStyle::Fit,
+                ..base.clone()
+            },
+            RenderConfig {
+                layout: Layout::Span,
+                ..base.clone()
+            },
+            RenderConfig {
+                cover_scale: base.cover_scale + 0.1,
+                ..base.clone()
+            },
+            RenderConfig {
+                blur_strength: base.blur_strength + 1.0,
+                ..base.clone()
+            },
+            RenderConfig {
+                darken: base.darken + 0.1,
+                ..base.clone()
+            },
+        ];
+
+        for variant in &variants {
+            assert_ne!(
+                variant.fingerprint(),
+                baseline,
+                "{variant:?} shares a fingerprint with the default"
+            );
+        }
+
+        // And all of them distinct from each other, not merely from the base.
+        let mut seen: Vec<String> = variants.iter().map(|v| v.fingerprint()).collect();
+        let total = seen.len();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), total, "two render configs collided");
+    }
+
+    /// The same config must key the same file, or every reload would re-render
+    /// and orphan the previous entry in the cache.
+    #[test]
+    fn an_unchanged_render_config_keys_the_same_render() {
+        let cfg = RenderConfig::default();
+        assert_eq!(cfg.fingerprint(), cfg.clone().fingerprint());
     }
 }
